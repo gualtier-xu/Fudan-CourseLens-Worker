@@ -1,0 +1,7 @@
+numpy==2.2.6
+Pillow==11.3.0
+PyNaCl==1.6.2
+rapidocr-onnxruntime==1.4.4
+requests==2.34.2
+sherpa-onnx==1.13.4
+zstandard==0.25.0

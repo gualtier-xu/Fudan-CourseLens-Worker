@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fudan-courselens-worker"
+version = "0.1.0"
+description = "Generic encrypted CPU worker for derived learning content"
+requires-python = ">=3.10,<3.13"
+license = "Apache-2.0"
+dependencies = [
+  "numpy==2.2.6",
+  "Pillow==11.3.0",
+  "PyNaCl==1.6.2",
+  "rapidocr-onnxruntime==1.4.4",
+  "requests==2.34.2",
+  "sherpa-onnx==1.13.4",
+  "zstandard==0.25.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["courselens_worker*"]

@@ -1,0 +1,74 @@
+name: Process encrypted CourseLens job
+run-name: CourseLens job ${{ inputs.task_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: Opaque 32-character job identifier
+        required: true
+        type: string
+      protocol_version:
+        description: Encrypted job protocol version
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: courselens-${{ inputs.task_id }}
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    environment: courselens-worker
+    env:
+      COURSELENS_TASK_ID: ${{ inputs.task_id }}
+      COURSELENS_PROTOCOL_VERSION: ${{ inputs.protocol_version }}
+      PRIVATE_JOB_REPO: gualtier-xu/Fudan-CourseLens-Private
+      PRIVATE_JOB_REPO_TOKEN: ${{ secrets.PRIVATE_JOB_REPO_TOKEN }}
+      WORKER_INPUT_PRIVATE_KEY: ${{ secrets.WORKER_INPUT_PRIVATE_KEY }}
+      WORKER_SIGNING_PRIVATE_KEY: ${{ secrets.WORKER_SIGNING_PRIVATE_KEY }}
+      COURSELENS_MODEL_ROOT: ${{ github.workspace }}/.models
+      COURSELENS_RESULT_PATH: ${{ github.workspace }}/result.box.json
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.10"
+          cache: pip
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: .models
+          key: asr-models-v1-sensevoice-7d1efa21-firered-1da8b737
+      - name: Install pinned runtime
+        run: python -m pip install --requirement requirements.txt
+      - name: Restore verified model cache
+        run: python scripts/install_models.py
+      - name: Process encrypted job
+        run: python -m courselens_worker
+      - name: Upload encrypted checkpoints
+        if: always() && hashFiles('.work/checkpoints/*.box.json') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: courselens-checkpoint-${{ inputs.task_id }}-${{ github.run_attempt }}
+          path: .work/checkpoints/*.box.json
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 0
+      - name: Upload encrypted result only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: courselens-result-${{ inputs.task_id }}
+          path: result.box.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Remove transient data
+        if: always()
+        run: |
+          rm -f result.box.json
+          rm -rf .work

@@ -1,0 +1,61 @@
+# Fudan CourseLens CPU Worker
+
+This public repository contains the generic, CPU-only GitHub Actions worker for
+Fudan CourseLens. It transforms a user-authorized, short-lived HTTPS media
+stream into derived learning material such as subtitles, OCR text, summaries,
+and chapters.
+
+## Important boundary
+
+This repository **does not** contain course discovery, account login, WebVPN,
+course-platform APIs, URL signing, original-video saving, resumable media
+transfer, batch acquisition, or media archiving. It cannot obtain a course
+source by itself. The worker accepts only an encrypted job created by the
+user's local private application after a runner has started.
+
+The media input is decoded directly into bounded mono PCM chunks. Encoded
+source containers are never written to disk or uploaded as artifacts. Only an
+encrypted derived-content result is retained, for seven days at most; the local
+application deletes it immediately after a successful transactional import.
+
+This boundary follows the same responsible-use principle documented by
+[Fudan_iCourse_Subscriber](https://github.com/gualtier-xu/Fudan_iCourse_Subscriber#readme).
+
+## Processing modes
+
+- `fast`: SenseVoice INT8 on four CPU threads.
+- `no-proofread`: FireRedASR2 CTC INT8 on four CPU threads.
+- `standard`: SenseVoice, then FireRedASR2 CTC, then user-authorized DeepSeek
+  proofreading. The two ASR models are never run concurrently.
+- `summary`: optional RapidOCR, then DeepSeek summary and chapter generation.
+
+All inputs and outputs use the versioned `job.v1` / `result.v1` protocol.
+Inputs are encrypted to the worker's X25519 public key. Results are encrypted
+to a per-job local public key and signed with the worker's Ed25519 key.
+ASR, OCR, proofreading, and summary-map windows emit encrypted checkpoints;
+a replacement workflow resumes only after the last fully verified window.
+
+## Repository secrets
+
+The `courselens-worker` environment requires:
+
+- `PRIVATE_JOB_REPO_TOKEN`: fine-grained PAT with read-only Issues permission
+  for `gualtier-xu/Fudan-CourseLens-Private`.
+- `WORKER_INPUT_PRIVATE_KEY`: base64 X25519 private key.
+- `WORKER_SIGNING_PRIVATE_KEY`: base64 Ed25519 seed.
+
+`PRIVATE_JOB_REPO` is an environment variable, not a secret. Pull-request CI
+uses synthetic fixtures and never receives the production environment.
+
+## Local verification
+
+```bash
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -p 'test_*.py'
+python scripts/check_public_boundary.py
+```
+
+## License
+
+Apache License 2.0. Model weights are fetched from their upstream projects and
+remain subject to their respective licenses.
