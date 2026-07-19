@@ -9,6 +9,7 @@ from courselens_worker.source import (
     _PinnedHTTPSConnection,
     resolve_source,
     safe_headers,
+    safe_source_error_code,
     validate_https_url,
 )
 
@@ -44,6 +45,16 @@ class SourceSecurityTests(unittest.TestCase):
     def test_public_https_is_accepted(self, resolve):
         resolve.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
         self.assertEqual(validate_https_url("https://example.com/media"), "https://example.com/media")
+
+    def test_public_log_reason_is_closed_set_and_never_echoes_input(self):
+        self.assertEqual(
+            safe_source_error_code(SourceSecurityError("source resolved to a non-public address")),
+            "non_public_address",
+        )
+        secret_url = "https://example.invalid/media?token=secret"
+        reason = safe_source_error_code(SourceSecurityError(secret_url))
+        self.assertEqual(reason, "source_security_error")
+        self.assertNotIn("secret", reason)
 
     @patch("courselens_worker.source._request_once")
     @patch("courselens_worker.source.socket.getaddrinfo")

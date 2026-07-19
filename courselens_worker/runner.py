@@ -287,7 +287,19 @@ def main() -> int:
         return run()
     except Exception as exc:
         # Avoid str(exc): networking libraries often embed an authorized URL.
-        print(f"worker_failed type={type(exc).__name__}", file=sys.stderr, flush=True)
+        detail = ""
+        try:
+            from .source import SourceSecurityError, safe_source_error_code
+
+            if isinstance(exc, SourceSecurityError):
+                detail = f" reason={safe_source_error_code(exc)}"
+        except Exception:
+            detail = ""
+        print(
+            f"worker_failed type={type(exc).__name__}{detail}",
+            file=sys.stderr,
+            flush=True,
+        )
         return 1
 
 

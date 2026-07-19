@@ -22,6 +22,36 @@ class SourceSecurityError(ValueError):
     pass
 
 
+def safe_source_error_code(error: BaseException) -> str:
+    """Return a fixed, non-sensitive diagnostic code for public CI logs.
+
+    Source failures can happen before any model work starts.  The authorized
+    URL and headers must never enter a public log, so callers only receive one
+    of these closed-set reason codes.
+    """
+    message = str(error)
+    exact = {
+        "source header contains a line break": "header_line_break",
+        "source must be an authenticated-free HTTPS URL": "invalid_https_url",
+        "source uses a non-HTTPS port": "invalid_https_port",
+        "source host could not be resolved": "dns_resolution_failed",
+        "source host has no addresses": "dns_no_addresses",
+        "source resolved to a non-public address": "non_public_address",
+        "source redirect has no location": "redirect_without_location",
+        "source exceeded the redirect limit": "redirect_limit",
+        "source image exceeds the size limit": "image_size_limit",
+    }
+    if message in exact:
+        return exact[message]
+    if message.startswith("source request failed:"):
+        return "connection_failed"
+    if message.startswith("source authorization probe returned HTTP "):
+        return "authorization_http_error"
+    if message.startswith("source image returned HTTP "):
+        return "image_http_error"
+    return "source_security_error"
+
+
 @dataclass(frozen=True)
 class ResolvedSource:
     url: str
