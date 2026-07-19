@@ -14,7 +14,7 @@ import numpy as np
 import sherpa_onnx
 
 from .formats import normalize_segments
-from .source import pinned_curl_command
+from .source import pinned_media_proxy
 
 SAMPLE_RATE = 16_000
 PCM_CHUNK_SECONDS = 10 * 60
@@ -26,33 +26,25 @@ class ASRError(RuntimeError):
 
 
 def _probe_duration(source: dict[str, Any]) -> float:
-    curl = subprocess.Popen(
-        pinned_curl_command(source), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-    )
     try:
-        completed = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                "-of", "default=nw=1:nk=1", "-i", "pipe:0",
-            ],
-            stdin=curl.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=120,
-        )
-        if curl.stdout:
-            curl.stdout.close()
-        curl_returncode = curl.wait(timeout=10)
+        with pinned_media_proxy(source) as media_url:
+            completed = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=nw=1:nk=1", media_url,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=120,
+            )
     except (subprocess.TimeoutExpired, OSError):
-        curl.kill()
-        curl.wait()
         raise ASRError("authorized media duration probe timed out")
     try:
         duration = float(completed.stdout.strip())
     except (TypeError, ValueError):
         duration = 0.0
-    if curl_returncode != 0 or completed.returncode != 0 or duration <= 0:
+    if completed.returncode != 0 or duration <= 0:
         raise ASRError("authorized media duration could not be determined")
     return duration
 
@@ -127,34 +119,23 @@ class RecognizerPool:
 
 
 def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, duration: float) -> None:
-    curl = subprocess.Popen(
-        pinned_curl_command(source), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-    )
-    command = [
-        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-        "-ss", f"{offset:.3f}", "-t", f"{duration:.3f}",
-        "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-y", str(target),
-    ]
-    ffmpeg = subprocess.Popen(
-        command, stdin=curl.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    if curl.stdout:
-        curl.stdout.close()
     try:
-        ffmpeg_returncode = ffmpeg.wait(timeout=900)
-        if ffmpeg_returncode == 0:
-            curl.terminate()
-        curl_returncode = curl.wait(timeout=10)
+        with pinned_media_proxy(source) as media_url:
+            completed = subprocess.run(
+                [
+                    "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                    "-ss", f"{offset:.3f}", "-i", media_url, "-t", f"{duration:.3f}",
+                    "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le",
+                    "-y", str(target),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=900,
+            )
     except subprocess.TimeoutExpired:
-        ffmpeg.kill()
-        curl.kill()
-        ffmpeg.wait()
-        curl.wait()
         target.unlink(missing_ok=True)
         raise ASRError("authorized media decode timed out")
-    # ffmpeg may intentionally close the pipe after the requested slice, so a
-    # curl broken-pipe status is acceptable when decoded PCM is complete.
-    if ffmpeg_returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+    if completed.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
         target.unlink(missing_ok=True)
         raise ASRError("ffmpeg could not decode the authorized media stream")
 

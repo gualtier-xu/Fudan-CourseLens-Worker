@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import socket
 import unittest
+import urllib.request
 from unittest.mock import Mock, call, patch
 
 from courselens_worker.source import (
     SourceSecurityError,
     _PinnedHTTPSConnection,
+    pinned_media_proxy,
     resolve_source,
     safe_headers,
     safe_source_error_code,
@@ -15,12 +17,24 @@ from courselens_worker.source import (
 
 
 class FakeResponse:
-    def __init__(self, status, location=""):
+    def __init__(self, status, location="", *, body=b"", headers=None):
         self.status = status
         self.location = location
+        self.body = body
+        self.offset = 0
+        self.headers = dict(headers or {})
 
     def getheader(self, name, default=""):
-        return self.location if name.lower() == "location" else default
+        if name.lower() == "location":
+            return self.location
+        return self.headers.get(name, self.headers.get(name.lower(), default))
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = len(self.body) - self.offset
+        block = self.body[self.offset:self.offset + size]
+        self.offset += len(block)
+        return block
 
     def close(self):
         return None
@@ -76,6 +90,35 @@ class SourceSecurityTests(unittest.TestCase):
         reason = safe_source_error_code(SourceSecurityError(secret_url))
         self.assertEqual(reason, "source_security_error")
         self.assertNotIn("secret", reason)
+
+    @patch("courselens_worker.source._request_once")
+    def test_loopback_proxy_forwards_one_bounded_range_without_disk(self, request):
+        request.side_effect = [
+            (Mock(), FakeResponse(200)),
+            (Mock(), FakeResponse(
+                206,
+                body=b"test",
+                headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Length": "4",
+                    "Content-Range": "bytes 10-13/100",
+                    "Accept-Ranges": "bytes",
+                },
+            )),
+        ]
+        source = {
+            "url": "https://media.example.com/video",
+            "headers": {"User-Agent": "CourseLens"},
+            "resolved_public_ip": "93.184.216.34",
+        }
+        with pinned_media_proxy(source) as local_url:
+            self.assertTrue(local_url.startswith("http://127.0.0.1:"))
+            probe = urllib.request.Request(local_url, headers={"Range": "bytes=10-13"})
+            with urllib.request.urlopen(probe, timeout=5) as response:
+                self.assertEqual(response.status, 206)
+                self.assertEqual(response.read(), b"test")
+        self.assertEqual(request.call_args_list[1].args[2], "93.184.216.34")
+        self.assertEqual(request.call_args_list[1].args[1]["Range"], "bytes=10-13")
 
     @patch("courselens_worker.source._request_once")
     @patch("courselens_worker.source.socket.getaddrinfo")

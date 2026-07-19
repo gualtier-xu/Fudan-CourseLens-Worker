@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import ipaddress
 import http.client
+import http.server
+import re
+import secrets
 import ssl
 import socket
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urljoin, urlsplit
 
 
@@ -16,6 +21,7 @@ ALLOWED_HEADERS = {
     "origin", "pragma", "referer", "user-agent",
 }
 MAX_REDIRECTS = 5
+_SINGLE_RANGE = re.compile(r"^bytes=(?:\d+-\d*|-\d+)$", re.IGNORECASE)
 
 
 class SourceSecurityError(ValueError):
@@ -204,6 +210,108 @@ def pinned_curl_command(source: dict[str, Any]) -> list[str]:
         command += ["--header", f"{name}: {value}"]
     command += [resolved.url]
     return command
+
+
+class _PinnedRangeProxy(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, resolved: ResolvedSource, path: str):
+        self.resolved = resolved
+        self.media_path = path
+        super().__init__(("127.0.0.1", 0), _PinnedRangeHandler)
+
+
+class _PinnedRangeHandler(http.server.BaseHTTPRequestHandler):
+    server: _PinnedRangeProxy
+
+    def log_message(self, _format: str, *args: Any) -> None:
+        return
+
+    def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self._forward(head_only=True)
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self._forward(head_only=False)
+
+    def _forward(self, *, head_only: bool) -> None:
+        if urlsplit(self.path).path != self.server.media_path:
+            self.send_error(404)
+            return
+        range_header = str(self.headers.get("Range") or "").strip()
+        if range_header and not _SINGLE_RANGE.fullmatch(range_header):
+            self.send_error(416)
+            return
+        resolved = self.server.resolved
+        headers = dict(resolved.headers)
+        if range_header:
+            headers["Range"] = range_header
+        connection = response = None
+        try:
+            connection, response = _request_once(
+                resolved.url,
+                headers,
+                resolved.ip,
+                timeout=60,
+                probe=False,
+            )
+            status = int(response.status)
+            if status not in {200, 206, 416}:
+                self.send_error(502)
+                return
+            self.send_response(status)
+            for name in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag"):
+                value = response.getheader(name, "")
+                if value:
+                    self.send_header(name, value)
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            if head_only or status == 416:
+                return
+            while True:
+                block = response.read(64 * 1024)
+                if not block:
+                    break
+                self.wfile.write(block)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception:
+            try:
+                self.send_error(502)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        finally:
+            if response is not None:
+                response.close()
+            if connection is not None:
+                connection.close()
+
+
+@contextmanager
+def pinned_media_proxy(source: dict[str, Any]) -> Iterator[str]:
+    """Expose one validated source as a loopback-only, transient Range URL.
+
+    FFmpeg needs random-access Range requests for many MP4 files.  The proxy
+    keeps the authorized upstream and its headers out of the process command,
+    pins every connection to the validated public IP, and never writes media
+    bytes to disk.
+    """
+    headers = safe_headers(source.get("headers"))
+    resolved = resolve_source(
+        str(source.get("url") or ""),
+        headers,
+        public_ip_hint=str(source.get("resolved_public_ip") or ""),
+    )
+    path = f"/{secrets.token_urlsafe(24)}"
+    server = _PinnedRangeProxy(resolved, path)
+    thread = threading.Thread(target=server.serve_forever, name="courselens-range-proxy", daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}{path}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def fetch_bytes(source: dict[str, Any], *, max_bytes: int = 25 * 1024 * 1024) -> bytes:
