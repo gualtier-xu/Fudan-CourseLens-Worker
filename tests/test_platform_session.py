@@ -15,6 +15,13 @@ from courselens_worker.platform_session import (
 class _FakeConnector:
     login_values = None
 
+    class _Session:
+        def close(self):
+            return None
+
+    def __init__(self):
+        self.session = self._Session()
+
     def login(self, account, password):
         type(self).login_values = (account, password)
 
@@ -75,6 +82,55 @@ class PlatformSessionTests(unittest.TestCase):
         parsed = urlsplit(source["url"])
         self.assertEqual(parsed.hostname, "webvpn.fudan.edu.cn")
         self.assertIn("clientUUID=test", parsed.query)
+
+    def test_connection_failure_retries_without_retrying_authentication_errors(self):
+        class FlakyConnector(_FakeConnector):
+            attempts = 0
+
+            def login(self, account, password):
+                type(self).attempts += 1
+                if type(self).attempts < 3:
+                    raise PlatformSessionError("platform_connection_failed")
+                super().login(account, password)
+
+        job = {
+            "payload": {
+                "media": {},
+                "source_session": {
+                    "provider": "runner-session-v1", "course_id": "1", "sub_id": "2",
+                    "media": True, "slides": False,
+                },
+            },
+            "secrets": {"source_credentials": {"account": "a", "password": "p"}},
+        }
+        with patch("courselens_worker.platform_session.PlatformSession", FlakyConnector), patch(
+            "courselens_worker.platform_session.time.sleep"
+        ) as sleep:
+            materialize_job_sources(job)
+        self.assertEqual(FlakyConnector.attempts, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+        class RejectedConnector(_FakeConnector):
+            attempts = 0
+
+            def login(self, account, password):
+                type(self).attempts += 1
+                raise PlatformSessionError("platform_auth_rejected")
+
+        rejected = {
+            "payload": {
+                "media": {},
+                "source_session": {
+                    "provider": "runner-session-v1", "course_id": "1", "sub_id": "2",
+                    "media": True, "slides": False,
+                },
+            },
+            "secrets": {"source_credentials": {"account": "a", "password": "p"}},
+        }
+        with patch("courselens_worker.platform_session.PlatformSession", RejectedConnector):
+            with self.assertRaises(PlatformSessionError):
+                materialize_job_sources(rejected)
+        self.assertEqual(RejectedConnector.attempts, 1)
 
 
 if __name__ == "__main__":

@@ -464,9 +464,21 @@ def materialize_job_sources(job: dict[str, Any]) -> dict[str, Any]:
     account = str(credentials.pop("account", "") or "")
     password = str(credentials.pop("password", "") or "")
     credentials.clear()
+    connector: PlatformSession | None = None
     try:
-        connector = PlatformSession()
-        connector.login(account, password)
+        for attempt in range(3):
+            connector = PlatformSession()
+            try:
+                connector.login(account, password)
+                break
+            except PlatformSessionError as exc:
+                connector.session.close()
+                connector = None
+                if str(exc) != "platform_connection_failed" or attempt == 2:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
+        if connector is None:
+            raise _fail("platform_connection_failed")
         course_id = str(request.get("course_id") or "")
         sub_id = str(request.get("sub_id") or "")
         if request.get("media"):
@@ -476,6 +488,8 @@ def materialize_job_sources(job: dict[str, Any]) -> dict[str, Any]:
         if request.get("slides"):
             payload["slides"] = connector.slide_sources(course_id, sub_id)
     finally:
+        if connector is not None:
+            connector.session.close()
         account = ""
         password = ""
     job["payload"] = payload
