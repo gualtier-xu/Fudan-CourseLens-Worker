@@ -256,7 +256,7 @@ class _PinnedRangeHandler(http.server.BaseHTTPRequestHandler):
             )
             status = int(response.status)
             if status not in {200, 206, 416}:
-                self.send_error(502)
+                self.send_error(status if 400 <= status <= 599 else 502)
                 return
             self.send_response(status)
             for name in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag"):

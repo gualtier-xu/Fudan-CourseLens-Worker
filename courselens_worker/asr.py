@@ -25,6 +25,26 @@ class ASRError(RuntimeError):
     pass
 
 
+def _decode_failure(stderr: str) -> ASRError:
+    """Classify bounded FFmpeg diagnostics without exposing their text."""
+    value = str(stderr or "").casefold()
+    for status, message in (
+        ("401", "authorized media request returned HTTP 401"),
+        ("403", "authorized media request returned HTTP 403"),
+        ("404", "authorized media request returned HTTP 404"),
+        ("429", "authorized media request returned HTTP 429"),
+    ):
+        if f"server returned {status}" in value or f"http error {status}" in value:
+            return ASRError(message)
+    if "server returned 5" in value or "http error 5" in value:
+        return ASRError("authorized media request returned HTTP 5xx")
+    if "moov atom" in value:
+        return ASRError("authorized media is missing a readable MP4 index")
+    if "invalid data" in value:
+        return ASRError("authorized media format was rejected by ffmpeg")
+    return ASRError("ffmpeg could not decode the authorized media stream")
+
+
 def _probe_duration(source: dict[str, Any]) -> float:
     try:
         with pinned_media_proxy(source) as media_url:
@@ -129,7 +149,8 @@ def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, durati
                     "-y", str(target),
                 ],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
                 timeout=900,
             )
     except subprocess.TimeoutExpired:
@@ -137,7 +158,7 @@ def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, durati
         raise ASRError("authorized media decode timed out")
     if completed.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
         target.unlink(missing_ok=True)
-        raise ASRError("ffmpeg could not decode the authorized media stream")
+        raise _decode_failure(completed.stderr)
 
 
 def transcribe(

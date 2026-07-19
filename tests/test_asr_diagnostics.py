@@ -20,6 +20,10 @@ class ASRDiagnosticsTests(unittest.TestCase):
         self.assertEqual(reason, "asr_error")
         self.assertNotIn("secret", reason)
 
+    def test_ffmpeg_text_is_reduced_to_a_fixed_http_reason(self):
+        error = ASRError("authorized media request returned HTTP 403")
+        self.assertEqual(safe_worker_error_detail(error), "media_http_403")
+
 
 if __name__ == "__main__":
     unittest.main()
