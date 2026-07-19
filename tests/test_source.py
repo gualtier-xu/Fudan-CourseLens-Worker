@@ -93,19 +93,16 @@ class SourceSecurityTests(unittest.TestCase):
 
     @patch("courselens_worker.source._request_once")
     def test_loopback_proxy_forwards_one_bounded_range_without_disk(self, request):
-        request.side_effect = [
-            (Mock(), FakeResponse(200)),
-            (Mock(), FakeResponse(
-                206,
-                body=b"test",
-                headers={
-                    "Content-Type": "video/mp4",
-                    "Content-Length": "4",
-                    "Content-Range": "bytes 10-13/100",
-                    "Accept-Ranges": "bytes",
-                },
-            )),
-        ]
+        request.return_value = (Mock(), FakeResponse(
+            206,
+            body=b"test",
+            headers={
+                "Content-Type": "video/mp4",
+                "Content-Length": "4",
+                "Content-Range": "bytes 10-13/100",
+                "Accept-Ranges": "bytes",
+            },
+        ))
         source = {
             "url": "https://media.example.com/video",
             "headers": {"User-Agent": "CourseLens"},
@@ -117,8 +114,9 @@ class SourceSecurityTests(unittest.TestCase):
             with urllib.request.urlopen(probe, timeout=5) as response:
                 self.assertEqual(response.status, 206)
                 self.assertEqual(response.read(), b"test")
-        self.assertEqual(request.call_args_list[1].args[2], "93.184.216.34")
-        self.assertEqual(request.call_args_list[1].args[1]["Range"], "bytes=10-13")
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.args[2], "93.184.216.34")
+        self.assertEqual(request.call_args.args[1]["Range"], "bytes=10-13")
 
     @patch("courselens_worker.source._request_once")
     @patch("courselens_worker.source.socket.getaddrinfo")

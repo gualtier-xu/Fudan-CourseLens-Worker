@@ -297,11 +297,17 @@ def pinned_media_proxy(source: dict[str, Any]) -> Iterator[str]:
     bytes to disk.
     """
     headers = safe_headers(source.get("headers"))
-    resolved = resolve_source(
-        str(source.get("url") or ""),
-        headers,
-        public_ip_hint=str(source.get("resolved_public_ip") or ""),
-    )
+    source_url = str(source.get("url") or "")
+    public_ip_hint = str(source.get("resolved_public_ip") or "")
+    if public_ip_hint:
+        # A short-lived source may permit only one authorization request.
+        # The IP hint is still independently checked as globally routable and
+        # the actual request still performs hostname TLS/SNI validation, so an
+        # extra network probe is unnecessary and can consume that request.
+        validated_url, validated_ip = _validate_and_resolve(source_url, public_ip_hint)
+        resolved = ResolvedSource(validated_url, headers, validated_ip)
+    else:
+        resolved = resolve_source(source_url, headers)
     path = f"/{secrets.token_urlsafe(24)}"
     server = _PinnedRangeProxy(resolved, path)
     thread = threading.Thread(target=server.serve_forever, name="courselens-range-proxy", daemon=True)
