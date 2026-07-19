@@ -8,6 +8,8 @@ from unittest.mock import Mock, call, patch
 from courselens_worker.source import (
     SourceSecurityError,
     _PinnedHTTPSConnection,
+    classify_media_response,
+    open_pinned_stream,
     pinned_connect_proxy,
     pinned_media_proxy,
     resolve_source,
@@ -42,6 +44,18 @@ class FakeResponse:
 
 
 class SourceSecurityTests(unittest.TestCase):
+    def test_media_response_profile_is_closed_and_detects_expected_types(self):
+        mp4 = classify_media_response(200, "video/mp4", b"\x00\x00\x00\x20ftypisom")
+        self.assertEqual((mp4.http, mp4.content, mp4.magic), (
+            "http_2xx", "content_video", "magic_iso_bmff"
+        ))
+        html = classify_media_response(200, "text/html; charset=utf-8", b" <!doctype html>")
+        self.assertEqual((html.content, html.magic), ("content_html", "magic_html"))
+        json_value = classify_media_response(403, "application/json", b'{"error":true}')
+        self.assertEqual((json_value.http, json_value.content, json_value.magic), (
+            "http_403", "content_json", "magic_json"
+        ))
+
     def test_header_allowlist_and_crlf(self):
         self.assertEqual(
             safe_headers({"Cookie": "a=b", "Host": "bad", "Range": "bytes=0-"}),
@@ -74,6 +88,60 @@ class SourceSecurityTests(unittest.TestCase):
         resolve.assert_not_called()
         self.assertEqual(request.call_args.args[0], "https://media.example.com/video")
         self.assertEqual(request.call_args.args[2], "93.184.216.34")
+
+    @patch("courselens_worker.source._request_once")
+    @patch("courselens_worker.source.socket.getaddrinfo")
+    def test_stream_with_public_hint_uses_one_non_probe_request(self, resolve, request):
+        connection = Mock()
+        request.return_value = (
+            connection,
+            FakeResponse(200, body=b"\x00\x00\x00\x20ftypisom", headers={"Content-Type": "video/mp4"}),
+        )
+        source = {
+            "url": "https://media.example.com/video",
+            "headers": {"Cookie": "secret"},
+            "resolved_public_ip": "93.184.216.34",
+        }
+        with open_pinned_stream(source) as stream:
+            prefix = stream.response.read(64)
+            profile = classify_media_response(
+                stream.response.status,
+                stream.response.getheader("Content-Type", ""),
+                prefix,
+            )
+        self.assertEqual(profile.magic, "magic_iso_bmff")
+        resolve.assert_not_called()
+        request.assert_called_once_with(
+            "https://media.example.com/video",
+            {"Cookie": "secret"},
+            "93.184.216.34",
+            timeout=60,
+            probe=False,
+        )
+        connection.close.assert_called_once()
+
+    @patch("courselens_worker.source._request_once")
+    @patch("courselens_worker.source.socket.getaddrinfo")
+    def test_stream_redirect_revalidates_and_drops_cross_host_credentials(self, resolve, request):
+        resolve.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.35", 443)),
+        ]
+        request.side_effect = [
+            (Mock(), FakeResponse(302, "https://cdn.example.net/media")),
+            (Mock(), FakeResponse(200, body=b"\x00\x00\x00\x20ftypisom")),
+        ]
+        source = {
+            "url": "https://media.example.com/video",
+            "headers": {"Cookie": "secret", "Origin": "https://media.example.com", "User-Agent": "CourseLens"},
+            "resolved_public_ip": "93.184.216.34",
+        }
+        with open_pinned_stream(source) as stream:
+            self.assertEqual(stream.response.status, 200)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[1].args[1], {"User-Agent": "CourseLens"})
+        self.assertEqual(request.call_args_list[1].args[2], "93.184.216.35")
+        self.assertFalse(request.call_args_list[0].kwargs["probe"])
+        self.assertFalse(request.call_args_list[1].kwargs["probe"])
 
     @patch("courselens_worker.source.socket.getaddrinfo")
     def test_private_or_malformed_ip_hint_is_rejected_before_connect(self, resolve):

@@ -68,6 +68,18 @@ class ResolvedSource:
     ip: str
 
 
+@dataclass(frozen=True)
+class PinnedResponseStream:
+    response: http.client.HTTPResponse
+
+
+@dataclass(frozen=True)
+class MediaResponseProfile:
+    http: str
+    content: str
+    magic: str
+
+
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     """HTTPS with certificate/SNI for the hostname and TCP fixed to one IP."""
 
@@ -188,6 +200,95 @@ def resolve_source(
 
 def resolve_redirects(url: str, headers: dict[str, str], *, timeout: int = 20) -> str:
     return resolve_source(url, headers, timeout=timeout).url
+
+
+def classify_media_response(
+    status: int,
+    content_type: str,
+    prefix: bytes,
+) -> MediaResponseProfile:
+    """Reduce an upstream response to fixed, non-sensitive categories."""
+    value = int(status or 0)
+    if value in {401, 403, 404, 429}:
+        http_code = f"http_{value}"
+    elif 200 <= value <= 299:
+        http_code = "http_2xx"
+    elif 300 <= value <= 399:
+        http_code = "http_3xx"
+    elif 400 <= value <= 499:
+        http_code = "http_4xx"
+    elif 500 <= value <= 599:
+        http_code = "http_5xx"
+    else:
+        http_code = "http_other"
+
+    media_type = str(content_type or "").split(";", 1)[0].strip().casefold()
+    if not media_type:
+        content_code = "content_missing"
+    elif media_type.startswith("video/"):
+        content_code = "content_video"
+    elif media_type in {"text/html", "application/xhtml+xml"}:
+        content_code = "content_html"
+    elif media_type == "application/json" or media_type.endswith("+json"):
+        content_code = "content_json"
+    else:
+        content_code = "content_other"
+
+    first = bytes(prefix or b"")[:64]
+    stripped = first.lstrip().lower()
+    if len(first) >= 12 and first[4:8] == b"ftyp":
+        magic_code = "magic_iso_bmff"
+    elif stripped.startswith((b"<!doctype html", b"<html", b"<head", b"<body")):
+        magic_code = "magic_html"
+    elif stripped.startswith((b"{", b"[")):
+        magic_code = "magic_json"
+    else:
+        magic_code = "magic_unknown"
+    return MediaResponseProfile(http=http_code, content=content_code, magic=magic_code)
+
+
+@contextmanager
+def open_pinned_stream(source: dict[str, Any], *, timeout: int = 60) -> Iterator[PinnedResponseStream]:
+    """Open the final HTTPS response without a separate authorization probe."""
+    headers = safe_headers(source.get("headers"))
+    current, ip = _validate_and_resolve(
+        str(source.get("url") or ""),
+        str(source.get("resolved_public_ip") or ""),
+    )
+    current_headers = dict(headers)
+    previous_host = str(urlsplit(current).hostname or "").casefold()
+    for _ in range(MAX_REDIRECTS + 1):
+        connection, response = _request_once(
+            current,
+            current_headers,
+            ip,
+            timeout=timeout,
+            probe=False,
+        )
+        if response.status in {301, 302, 303, 307, 308}:
+            try:
+                location = response.getheader("Location", "")
+                if not location:
+                    raise SourceSecurityError("source redirect has no location")
+                next_url, next_ip = _validate_and_resolve(urljoin(current, location))
+                next_host = str(urlsplit(next_url).hostname or "").casefold()
+                if next_host != previous_host:
+                    current_headers = {
+                        name: value for name, value in current_headers.items()
+                        if name.casefold() not in {"cookie", "origin", "referer"}
+                    }
+                current, ip, previous_host = next_url, next_ip, next_host
+            finally:
+                response.close()
+                connection.close()
+            continue
+        try:
+            yield PinnedResponseStream(response=response)
+        finally:
+            response.close()
+            connection.close()
+        return
+    raise SourceSecurityError("source exceeded the redirect limit")
 
 
 def ffmpeg_headers(headers: dict[str, str]) -> str:

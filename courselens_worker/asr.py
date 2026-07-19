@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -14,7 +15,11 @@ import numpy as np
 import sherpa_onnx
 
 from .formats import normalize_segments
-from .source import ffmpeg_headers, pinned_connect_proxy, pinned_curl_command
+from .source import (
+    MediaResponseProfile,
+    classify_media_response,
+    open_pinned_stream,
+)
 
 SAMPLE_RATE = 16_000
 PCM_CHUNK_SECONDS = 10 * 60
@@ -49,28 +54,128 @@ def _decode_failure(stderr: str) -> ASRError:
     return ASRError("ffmpeg could not decode the authorized media stream")
 
 
+def _media_response_error(profile: MediaResponseProfile) -> ASRError | None:
+    http_messages = {
+        "http_401": "authorized media request returned HTTP 401",
+        "http_403": "authorized media request returned HTTP 403",
+        "http_404": "authorized media request returned HTTP 404",
+        "http_429": "authorized media request returned HTTP 429",
+        "http_4xx": "authorized media request returned HTTP 4xx",
+        "http_5xx": "authorized media request returned HTTP 5xx",
+        "http_3xx": "authorized media request returned an unsupported redirect",
+        "http_other": "authorized media request returned an unsupported status",
+    }
+    if profile.http in http_messages:
+        return ASRError(http_messages[profile.http])
+    if profile.content == "content_html" or profile.magic == "magic_html":
+        return ASRError("authorized media response contained HTML")
+    if profile.content == "content_json" or profile.magic == "magic_json":
+        return ASRError("authorized media response contained JSON")
+    if profile.magic != "magic_iso_bmff":
+        return ASRError("authorized media signature was rejected")
+    return None
+
+
+def _drain_bounded(pipe, output: bytearray, *, limit: int = 16 * 1024) -> None:
+    while True:
+        block = pipe.read(4096)
+        if not block:
+            return
+        remaining = limit - len(output)
+        if remaining > 0:
+            output.extend(block[:remaining])
+
+
+def _run_media_pipe(
+    source: dict[str, Any],
+    command: list[str],
+    *,
+    timeout: int,
+    capture_stdout: bool,
+) -> tuple[int, bytes, bytes]:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    stdout = bytearray()
+    stderr = bytearray()
+    readers: list[threading.Thread] = []
+    if process.stdout is not None:
+        readers.append(threading.Thread(
+            target=_drain_bounded,
+            args=(process.stdout, stdout),
+            name="courselens-media-stdout",
+            daemon=True,
+        ))
+    if process.stderr is not None:
+        readers.append(threading.Thread(
+            target=_drain_bounded,
+            args=(process.stderr, stderr),
+            name="courselens-media-stderr",
+            daemon=True,
+        ))
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + max(1, int(timeout))
+    try:
+        with open_pinned_stream(source) as stream:
+            prefix = stream.response.read(64)
+            profile = classify_media_response(
+                int(stream.response.status),
+                stream.response.getheader("Content-Type", ""),
+                prefix,
+            )
+            error = _media_response_error(profile)
+            if error is not None:
+                raise error
+            if process.stdin is None:
+                raise ASRError("authorized media upstream connection failed")
+            try:
+                process.stdin.write(prefix)
+                while time.monotonic() < deadline:
+                    block = stream.response.read(64 * 1024)
+                    if not block:
+                        break
+                    process.stdin.write(block)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+        remaining = max(1, int(deadline - time.monotonic()))
+        process.wait(timeout=remaining)
+    except Exception:
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        for reader in readers:
+            reader.join(timeout=5)
+    return int(process.returncode or 0), bytes(stdout), bytes(stderr)
+
+
 def _probe_duration(source: dict[str, Any]) -> float:
     try:
-        with pinned_connect_proxy(source) as proxy:
-            completed = subprocess.run(
-                [
-                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                    "-of", "default=nw=1:nk=1", "-http_proxy", proxy.proxy_url,
-                    "-headers", ffmpeg_headers(proxy.headers), "-seekable", "0",
-                    proxy.source_url,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=120,
-            )
+        returncode, stdout, _ = _run_media_pipe(
+            source,
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=nw=1:nk=1", "-i", "pipe:0",
+            ],
+            timeout=120,
+            capture_stdout=True,
+        )
     except (subprocess.TimeoutExpired, OSError):
         raise ASRError("authorized media duration probe timed out")
     try:
-        duration = float(completed.stdout.strip())
+        duration = float(stdout.decode("ascii", errors="ignore").strip())
     except (TypeError, ValueError):
         duration = 0.0
-    if completed.returncode != 0 or duration <= 0:
+    if returncode != 0 or duration <= 0:
         raise ASRError("authorized media duration could not be determined")
     return duration
 
@@ -153,43 +258,22 @@ def _ffmpeg_pipe_command(target: Path, *, offset: float, duration: float) -> lis
 
 
 def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, duration: float) -> None:
-    curl = subprocess.Popen(
-        pinned_curl_command(source),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if curl.stdout is None:
-        curl.kill()
-        raise ASRError("authorized media upstream connection failed")
-    ffmpeg = subprocess.Popen(
-        _ffmpeg_pipe_command(target, offset=offset, duration=duration),
-        stdin=curl.stdout,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-    curl.stdout.close()
     try:
-        _, ffmpeg_stderr = ffmpeg.communicate(timeout=900)
-        if ffmpeg.returncode == 0 and curl.poll() is None:
-            curl.terminate()
-        try:
-            _, curl_stderr = curl.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            curl.kill()
-            _, curl_stderr = curl.communicate()
+        returncode, _, ffmpeg_stderr = _run_media_pipe(
+            source,
+            _ffmpeg_pipe_command(target, offset=offset, duration=duration),
+            timeout=900,
+            capture_stdout=False,
+        )
     except subprocess.TimeoutExpired:
-        ffmpeg.kill()
-        curl.kill()
-        ffmpeg.communicate()
-        curl.communicate()
         target.unlink(missing_ok=True)
         raise ASRError("authorized media decode timed out")
-    if ffmpeg.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+    except OSError:
         target.unlink(missing_ok=True)
-        diagnostic = b"\n".join((ffmpeg_stderr or b"", curl_stderr or b"")).decode(
-            "utf-8", errors="replace"
-        )
-        raise _decode_failure(diagnostic)
+        raise ASRError("authorized media upstream connection failed")
+    if returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+        target.unlink(missing_ok=True)
+        raise _decode_failure(ffmpeg_stderr.decode("utf-8", errors="replace"))
 
 
 def transcribe(

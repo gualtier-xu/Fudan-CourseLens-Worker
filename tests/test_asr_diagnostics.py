@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from courselens_worker.runner import safe_worker_error_detail
+from courselens_worker.source import MediaResponseProfile
 
 
 class ASRError(RuntimeError):
@@ -26,6 +27,21 @@ class ASRDiagnosticsTests(unittest.TestCase):
     def test_ffmpeg_text_is_reduced_to_a_fixed_http_reason(self):
         error = ASRError("authorized media request returned HTTP 403")
         self.assertEqual(safe_worker_error_detail(error), "media_http_403")
+
+    def test_media_response_failures_are_reduced_to_closed_reason_codes(self):
+        with patch.dict(sys.modules, {"numpy": Mock(), "sherpa_onnx": Mock()}):
+            from courselens_worker import asr
+        cases = (
+            (MediaResponseProfile("http_2xx", "content_html", "magic_html"), "media_content_html"),
+            (MediaResponseProfile("http_2xx", "content_json", "magic_json"), "media_content_json"),
+            (MediaResponseProfile("http_2xx", "content_video", "magic_unknown"), "media_magic_rejected"),
+            (MediaResponseProfile("http_403", "content_html", "magic_html"), "media_http_403"),
+        )
+        for profile, expected in cases:
+            with self.subTest(expected=expected):
+                error = asr._media_response_error(profile)
+                self.assertIsNotNone(error)
+                self.assertEqual(safe_worker_error_detail(error), expected)
 
     def test_slice_decode_discards_after_opening_the_single_input_stream(self):
         with patch.dict(sys.modules, {"numpy": Mock(), "sherpa_onnx": Mock()}):
