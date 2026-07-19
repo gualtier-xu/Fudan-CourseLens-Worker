@@ -52,7 +52,8 @@ def _probe_duration(source: dict[str, Any]) -> float:
                 [
                     "ffprobe", "-v", "error", "-show_entries", "format=duration",
                     "-of", "default=nw=1:nk=1", "-http_proxy", proxy.proxy_url,
-                    "-headers", ffmpeg_headers(proxy.headers), proxy.source_url,
+                    "-headers", ffmpeg_headers(proxy.headers), "-seekable", "0",
+                    proxy.source_url,
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -148,7 +149,11 @@ def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, durati
                     "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                     "-http_proxy", proxy.proxy_url,
                     "-headers", ffmpeg_headers(proxy.headers),
-                    "-ss", f"{offset:.3f}", "-i", proxy.source_url, "-t", f"{duration:.3f}",
+                    # Authorized media URLs can be single-use. Force one
+                    # sequential request from byte zero so FFmpeg reads the
+                    # MP4 index before discarding input up to the slice start.
+                    "-seekable", "0", "-i", proxy.source_url,
+                    "-ss", f"{offset:.3f}", "-t", f"{duration:.3f}",
                     "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le",
                     "-y", str(target),
                 ],
