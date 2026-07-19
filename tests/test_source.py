@@ -46,6 +46,27 @@ class SourceSecurityTests(unittest.TestCase):
         resolve.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
         self.assertEqual(validate_https_url("https://example.com/media"), "https://example.com/media")
 
+    @patch("courselens_worker.source._request_once")
+    @patch("courselens_worker.source.socket.getaddrinfo")
+    def test_public_ip_hint_bypasses_unavailable_dns_but_keeps_tls_hostname(self, resolve, request):
+        request.return_value = (Mock(), FakeResponse(200))
+        result = resolve_source(
+            "https://media.example.com/video",
+            {},
+            public_ip_hint="93.184.216.34",
+        )
+        self.assertEqual(result.ip, "93.184.216.34")
+        resolve.assert_not_called()
+        self.assertEqual(request.call_args.args[0], "https://media.example.com/video")
+        self.assertEqual(request.call_args.args[2], "93.184.216.34")
+
+    @patch("courselens_worker.source.socket.getaddrinfo")
+    def test_private_or_malformed_ip_hint_is_rejected_before_connect(self, resolve):
+        for hint in ("127.0.0.1", "10.0.0.1", "not-an-ip"):
+            with self.subTest(hint=hint), self.assertRaises(SourceSecurityError):
+                resolve_source("https://media.example.com/video", {}, public_ip_hint=hint)
+        resolve.assert_not_called()
+
     def test_public_log_reason_is_closed_set_and_never_echoes_input(self):
         self.assertEqual(
             safe_source_error_code(SourceSecurityError("source resolved to a non-public address")),

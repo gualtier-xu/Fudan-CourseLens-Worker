@@ -37,6 +37,7 @@ def safe_source_error_code(error: BaseException) -> str:
         "source host could not be resolved": "dns_resolution_failed",
         "source host has no addresses": "dns_no_addresses",
         "source resolved to a non-public address": "non_public_address",
+        "source supplied an invalid public address": "invalid_public_address_hint",
         "source redirect has no location": "redirect_without_location",
         "source exceeded the redirect limit": "redirect_limit",
         "source image exceeds the size limit": "image_size_limit",
@@ -84,13 +85,21 @@ def safe_headers(raw: dict[str, Any] | None) -> dict[str, str]:
     return result
 
 
-def _validate_and_resolve(url: str) -> tuple[str, str]:
+def _validate_and_resolve(url: str, public_ip_hint: str = "") -> tuple[str, str]:
     value = str(url or "").strip()
     parsed = urlsplit(value)
     if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
         raise SourceSecurityError("source must be an authenticated-free HTTPS URL")
     if parsed.port not in (None, 443):
         raise SourceSecurityError("source uses a non-HTTPS port")
+    if public_ip_hint:
+        try:
+            hinted_ip = ipaddress.ip_address(str(public_ip_hint).strip())
+        except ValueError as exc:
+            raise SourceSecurityError("source supplied an invalid public address") from exc
+        if not hinted_ip.is_global:
+            raise SourceSecurityError("source supplied an invalid public address")
+        return value, str(hinted_ip)
     try:
         addresses = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
@@ -134,8 +143,14 @@ def _request_once(
         raise SourceSecurityError(f"source request failed: {type(exc).__name__}") from exc
 
 
-def resolve_source(url: str, headers: dict[str, str], *, timeout: int = 20) -> ResolvedSource:
-    current, ip = _validate_and_resolve(url)
+def resolve_source(
+    url: str,
+    headers: dict[str, str],
+    *,
+    timeout: int = 20,
+    public_ip_hint: str = "",
+) -> ResolvedSource:
+    current, ip = _validate_and_resolve(url, public_ip_hint)
     current_headers = dict(headers)
     previous_host = str(urlsplit(current).hostname or "").lower()
     for _ in range(MAX_REDIRECTS + 1):
@@ -173,7 +188,11 @@ def ffmpeg_headers(headers: dict[str, str]) -> str:
 
 def pinned_curl_command(source: dict[str, Any]) -> list[str]:
     headers = safe_headers(source.get("headers"))
-    resolved = resolve_source(str(source.get("url") or ""), headers)
+    resolved = resolve_source(
+        str(source.get("url") or ""),
+        headers,
+        public_ip_hint=str(source.get("resolved_public_ip") or ""),
+    )
     parsed = urlsplit(resolved.url)
     address = f"[{resolved.ip}]" if ":" in resolved.ip else resolved.ip
     command = [
@@ -189,7 +208,11 @@ def pinned_curl_command(source: dict[str, Any]) -> list[str]:
 
 def fetch_bytes(source: dict[str, Any], *, max_bytes: int = 25 * 1024 * 1024) -> bytes:
     headers = safe_headers(source.get("headers"))
-    resolved = resolve_source(str(source.get("url") or ""), headers)
+    resolved = resolve_source(
+        str(source.get("url") or ""),
+        headers,
+        public_ip_hint=str(source.get("resolved_public_ip") or ""),
+    )
     connection, response = _request_once(
         resolved.url, resolved.headers, resolved.ip, timeout=30, probe=False
     )
