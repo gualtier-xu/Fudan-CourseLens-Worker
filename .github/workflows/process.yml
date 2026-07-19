@@ -52,6 +52,10 @@ jobs:
         with:
           path: .models
           key: asr-models-v1-sensevoice-7d1efa21-firered-1da8b737
+      - name: Install bounded media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes curl ffmpeg
       - name: Install pinned runtime
         run: python -m pip install --requirement requirements.txt
       - name: Restore verified model cache
