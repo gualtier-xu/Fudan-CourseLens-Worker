@@ -25,6 +25,32 @@ class WorkerError(RuntimeError):
     pass
 
 
+_ASR_ERROR_CODES = {
+    "authorized media duration probe timed out": "duration_probe_timeout",
+    "authorized media duration could not be determined": "duration_probe_failed",
+    "configured ASR model directory is incomplete": "model_incomplete",
+    "configured ASR token file is missing": "model_tokens_missing",
+    "unsupported ASR backend": "unsupported_backend",
+    "unsupported subtitle mode": "unsupported_mode",
+    "media start is invalid": "invalid_start",
+    "media duration is missing or outside the supported range": "invalid_duration",
+    "checkpoint subtitle mode does not match the job": "checkpoint_mode_mismatch",
+    "authorized media decode timed out": "media_decode_timeout",
+    "ffmpeg could not decode the authorized media stream": "media_decode_failed",
+}
+
+
+def safe_worker_error_detail(error: BaseException) -> str:
+    """Return an optional closed-set reason without importing compute deps."""
+    from .source import SourceSecurityError, safe_source_error_code
+
+    if isinstance(error, SourceSecurityError):
+        return safe_source_error_code(error)
+    if type(error).__name__ == "ASRError":
+        return _ASR_ERROR_CODES.get(str(error), "asr_error")
+    return ""
+
+
 def _required(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -287,12 +313,9 @@ def main() -> int:
         return run()
     except Exception as exc:
         # Avoid str(exc): networking libraries often embed an authorized URL.
-        detail = ""
         try:
-            from .source import SourceSecurityError, safe_source_error_code
-
-            if isinstance(exc, SourceSecurityError):
-                detail = f" reason={safe_source_error_code(exc)}"
+            reason = safe_worker_error_detail(exc)
+            detail = f" reason={reason}" if reason else ""
         except Exception:
             detail = ""
         print(
