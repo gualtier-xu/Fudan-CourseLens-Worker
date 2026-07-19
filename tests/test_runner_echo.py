@@ -12,7 +12,7 @@ class RunnerEchoTests(unittest.TestCase):
             "task_id": "0123456789abcdef0123456789abcdef",
             "job_kind": "echo",
             "input_hash": "0" * 64,
-            "pipeline": {"version": "actions-echo-v1"},
+            "pipeline": {"version": "actions-echo-v2"},
         })
         self.assertEqual(result["status"], "completed")
         self.assertTrue(result["outputs"]["echo"]["ok"])

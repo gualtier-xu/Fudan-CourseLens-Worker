@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: courselens-${{ inputs.task_id }}
+  group: courselens-compute-${{ github.repository_id }}
   cancel-in-progress: false
 
 jobs:
@@ -28,12 +28,20 @@ jobs:
     env:
       COURSELENS_TASK_ID: ${{ inputs.task_id }}
       COURSELENS_PROTOCOL_VERSION: ${{ inputs.protocol_version }}
-      PRIVATE_JOB_REPO: gualtier-xu/Fudan-CourseLens-Private
-      PRIVATE_JOB_REPO_TOKEN: ${{ secrets.PRIVATE_JOB_REPO_TOKEN }}
+      PRIVATE_JOB_REPO: ${{ vars.COURSELENS_MAILBOX_REPO }}
+      PRIVATE_JOB_REPO_TOKEN: ${{ secrets.COURSELENS_JOB_TOKEN || secrets.PRIVATE_JOB_REPO_TOKEN }}
       WORKER_INPUT_PRIVATE_KEY: ${{ secrets.WORKER_INPUT_PRIVATE_KEY }}
       WORKER_SIGNING_PRIVATE_KEY: ${{ secrets.WORKER_SIGNING_PRIVATE_KEY }}
       COURSELENS_MODEL_ROOT: ${{ github.workspace }}/.models
       COURSELENS_RESULT_PATH: ${{ github.workspace }}/result.box.json
+      COURSELENS_STANDARD_STRATEGY: ${{ vars.COURSELENS_STANDARD_STRATEGY || 'sequential' }}
+      COURSELENS_OCR_CONCURRENCY: ${{ vars.COURSELENS_OCR_CONCURRENCY || '1' }}
+      COURSELENS_IMAGE_PREFETCH: ${{ vars.COURSELENS_IMAGE_PREFETCH || '16' }}
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065

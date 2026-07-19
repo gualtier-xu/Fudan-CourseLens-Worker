@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import ipaddress
+import http.client
+import ssl
 import socket
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlsplit
-
-import requests
 
 
 ALLOWED_HEADERS = {
@@ -20,6 +20,25 @@ MAX_REDIRECTS = 5
 
 class SourceSecurityError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class ResolvedSource:
+    url: str
+    headers: dict[str, str]
+    ip: str
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS with certificate/SNI for the hostname and TCP fixed to one IP."""
+
+    def __init__(self, host: str, ip: str, *, timeout: int):
+        super().__init__(host, 443, timeout=timeout, context=ssl.create_default_context())
+        self._pinned_ip = ip
+
+    def connect(self) -> None:
+        raw = socket.create_connection((self._pinned_ip, 443), self.timeout, self.source_address)
+        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
 
 
 def safe_headers(raw: dict[str, Any] | None) -> dict[str, str]:
@@ -35,7 +54,7 @@ def safe_headers(raw: dict[str, Any] | None) -> dict[str, str]:
     return result
 
 
-def validate_https_url(url: str) -> str:
+def _validate_and_resolve(url: str) -> tuple[str, str]:
     value = str(url or "").strip()
     parsed = urlsplit(value)
     if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
@@ -52,57 +71,110 @@ def validate_https_url(url: str) -> str:
         ip = ipaddress.ip_address(address[4][0])
         if not ip.is_global:
             raise SourceSecurityError("source resolved to a non-public address")
-    return value
+    preferred = next((item[4][0] for item in addresses if item[0] == socket.AF_INET), addresses[0][4][0])
+    return value, str(preferred)
+
+
+def validate_https_url(url: str) -> str:
+    return _validate_and_resolve(url)[0]
+
+
+def _request_once(
+    url: str,
+    headers: dict[str, str],
+    ip: str,
+    *,
+    timeout: int,
+    probe: bool,
+):
+    parsed = urlsplit(url)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += f"?{parsed.query}"
+    request_headers = dict(headers)
+    request_headers["Host"] = str(parsed.hostname)
+    if probe:
+        request_headers["Range"] = "bytes=0-0"
+    connection = _PinnedHTTPSConnection(str(parsed.hostname), ip, timeout=timeout)
+    try:
+        connection.request("GET", path, headers=request_headers)
+        return connection, connection.getresponse()
+    except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+        connection.close()
+        raise SourceSecurityError(f"source request failed: {type(exc).__name__}") from exc
+
+
+def resolve_source(url: str, headers: dict[str, str], *, timeout: int = 20) -> ResolvedSource:
+    current, ip = _validate_and_resolve(url)
+    current_headers = dict(headers)
+    previous_host = str(urlsplit(current).hostname or "").lower()
+    for _ in range(MAX_REDIRECTS + 1):
+        connection, response = _request_once(current, current_headers, ip, timeout=timeout, probe=True)
+        try:
+            if response.status in {301, 302, 303, 307, 308}:
+                location = response.getheader("Location", "")
+                if not location:
+                    raise SourceSecurityError("source redirect has no location")
+                next_url, next_ip = _validate_and_resolve(urljoin(current, location))
+                next_host = str(urlsplit(next_url).hostname or "").lower()
+                if next_host != previous_host:
+                    current_headers = {
+                        name: value for name, value in current_headers.items()
+                        if name.lower() not in {"cookie", "origin", "referer"}
+                    }
+                current, ip, previous_host = next_url, next_ip, next_host
+                continue
+            if response.status >= 400:
+                raise SourceSecurityError(f"source authorization probe returned HTTP {response.status}")
+            return ResolvedSource(current, current_headers, ip)
+        finally:
+            response.close()
+            connection.close()
+    raise SourceSecurityError("source exceeded the redirect limit")
 
 
 def resolve_redirects(url: str, headers: dict[str, str], *, timeout: int = 20) -> str:
-    current = validate_https_url(url)
-    session = requests.Session()
-    for _ in range(MAX_REDIRECTS + 1):
-        try:
-            response = session.get(
-                current,
-                headers=headers,
-                allow_redirects=False,
-                stream=True,
-                timeout=timeout,
-            )
-        except requests.RequestException as exc:
-            raise SourceSecurityError(f"source authorization probe failed: {type(exc).__name__}") from exc
-        try:
-            if response.status_code in {301, 302, 303, 307, 308}:
-                location = response.headers.get("Location", "")
-                if not location:
-                    raise SourceSecurityError("source redirect has no location")
-                current = validate_https_url(urljoin(current, location))
-                continue
-            if response.status_code >= 400:
-                raise SourceSecurityError(f"source authorization probe returned HTTP {response.status_code}")
-            return current
-        finally:
-            response.close()
-    raise SourceSecurityError("source exceeded the redirect limit")
+    return resolve_source(url, headers, timeout=timeout).url
 
 
 def ffmpeg_headers(headers: dict[str, str]) -> str:
     return "".join(f"{name}: {value}\r\n" for name, value in headers.items())
 
 
+def pinned_curl_command(source: dict[str, Any]) -> list[str]:
+    headers = safe_headers(source.get("headers"))
+    resolved = resolve_source(str(source.get("url") or ""), headers)
+    parsed = urlsplit(resolved.url)
+    address = f"[{resolved.ip}]" if ":" in resolved.ip else resolved.ip
+    command = [
+        "curl", "--fail", "--silent", "--show-error", "--no-progress-meter",
+        "--proto", "=https", "--connect-timeout", "30", "--max-time", "21600",
+        "--resolve", f"{parsed.hostname}:443:{address}",
+    ]
+    for name, value in resolved.headers.items():
+        command += ["--header", f"{name}: {value}"]
+    command += [resolved.url]
+    return command
+
+
 def fetch_bytes(source: dict[str, Any], *, max_bytes: int = 25 * 1024 * 1024) -> bytes:
     headers = safe_headers(source.get("headers"))
-    url = resolve_redirects(str(source.get("url") or ""), headers)
+    resolved = resolve_source(str(source.get("url") or ""), headers)
+    connection, response = _request_once(
+        resolved.url, resolved.headers, resolved.ip, timeout=30, probe=False
+    )
     try:
-        response = requests.get(url, headers=headers, stream=True, timeout=30)
-    except requests.RequestException as exc:
-        raise SourceSecurityError(f"source image request failed: {type(exc).__name__}") from exc
-    try:
-        if response.status_code != 200:
-            raise SourceSecurityError(f"source image returned HTTP {response.status_code}")
+        if response.status != 200:
+            raise SourceSecurityError(f"source image returned HTTP {response.status}")
         output = bytearray()
-        for block in response.iter_content(64 * 1024):
+        while True:
+            block = response.read(64 * 1024)
+            if not block:
+                break
             output.extend(block)
             if len(output) > max_bytes:
                 raise SourceSecurityError("source image exceeds the size limit")
         return bytes(output)
     finally:
         response.close()
+        connection.close()

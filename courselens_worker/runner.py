@@ -10,7 +10,15 @@ from pathlib import Path
 from typing import Any
 
 from .mailbox import IssueMailbox
-from .protocol import PROTOCOL_VERSION, RESULT_SCHEMA, open_job, seal_result, validate_task_id
+from .protocol import (
+    CONTROL_SCHEMA,
+    PROTOCOL_VERSION,
+    RESULT_SCHEMA,
+    open_job,
+    seal_control,
+    seal_result,
+    validate_task_id,
+)
 
 
 class WorkerError(RuntimeError):
@@ -72,7 +80,7 @@ def process_job(
             }
         }
         metrics = value["metrics"]
-    elif kind == "summary":
+    elif kind in {"summary", "chapters"}:
         from .llm import create_summary
         from .ocr import process_slides
 
@@ -103,12 +111,74 @@ def process_job(
             prior_checkpoint=prior,
             checkpoint=summary_checkpoint,
         )
-        outputs = {"ppt_pages": pages, "summary": summary}
+        outputs = {"ppt_pages": pages}
+        if kind == "chapters":
+            outputs["chapters"] = list(summary.get("chapters") or [])
+        else:
+            outputs["summary"] = summary
         metrics = {
             "elapsed_seconds": round(time.monotonic() - started, 3),
             "transcript_segments": len(transcript),
             "ppt_pages": len(pages),
         }
+    elif kind == "learning_pack":
+        from .asr import transcribe
+        from .formats import to_srt, to_vtt
+        from .llm import create_summary, proofread_segments
+        from .ocr import process_slides
+
+        payload = dict(job.get("payload") or {})
+        requested = set(job.get("requested_outputs") or [])
+        secrets = dict(job.get("secrets") or {})
+        api_key = str(secrets.get("deepseek_api_key") or "")
+        outputs: dict[str, Any] = {}
+        metrics = {}
+        transcript = list(payload.get("transcript") or [])
+        prior = dict(payload.get("checkpoint") or {})
+        if "subtitle" in requested:
+            value = transcribe(
+                job,
+                sensevoice_dir=Path(_required("SENSEVOICE_MODEL_DIR")),
+                firered_dir=Path(_required("FIRERED_MODEL_DIR")),
+                proofread=(lambda sense, fire, saved, write: proofread_segments(
+                    api_key, sense, fire, prior_checkpoint=saved, checkpoint=write
+                )),
+                progress=_progress,
+                checkpoint=checkpoint_writer,
+            )
+            transcript = value["segments"]
+            outputs["subtitle"] = {
+                "mode": value["mode"],
+                "segments": transcript,
+                "srt": to_srt(transcript),
+                "vtt": to_vtt(transcript),
+                "raw_sensevoice": value["raw_sensevoice"],
+                "raw_firered": value["raw_firered"],
+            }
+            metrics["subtitle"] = value["metrics"]
+        slides = list(payload.get("slides") or [])
+        pages = process_slides(
+            slides,
+            progress=_progress,
+            prior_checkpoint=prior,
+            checkpoint=checkpoint_writer,
+        ) if slides and requested.intersection({"ocr", "summary", "chapters"}) else list(prior.get("ppt_pages") or [])
+        if "ocr" in requested:
+            outputs["ppt_pages"] = pages
+        if requested.intersection({"summary", "chapters"}):
+            summary = create_summary(
+                api_key,
+                title=str(payload.get("title") or ""),
+                transcript=transcript,
+                ppt_pages=pages,
+                prior_checkpoint=prior,
+                checkpoint=checkpoint_writer,
+            )
+            if "summary" in requested:
+                outputs["summary"] = summary
+            if "chapters" in requested:
+                outputs["chapters"] = list(summary.get("chapters") or [])
+        metrics["elapsed_seconds"] = round(time.monotonic() - started, 3)
     else:
         raise WorkerError("unsupported job kind")
     return {
@@ -117,7 +187,7 @@ def process_job(
         "task_id": job["task_id"],
         "job_kind": kind,
         "input_hash": job["input_hash"],
-        "pipeline_fingerprint": str(dict(job.get("pipeline") or {}).get("version") or "v1"),
+        "pipeline_fingerprint": str(dict(job.get("pipeline") or {}).get("version") or "v2"),
         "status": "completed",
         "outputs": outputs,
         "metrics": metrics,
@@ -137,6 +207,29 @@ def run() -> int:
         raise WorkerError("mailbox task id does not match the workflow")
     print(f"task={task_id} stage=processing kind={job['job_kind']}", flush=True)
     checkpoint_root = Path(".work") / "checkpoints"
+    control_sequence = 0
+
+    def publish_control(kind: str, payload: dict[str, Any]) -> None:
+        nonlocal control_sequence
+        control_sequence += 1
+        value = {
+            "schema": CONTROL_SCHEMA,
+            "protocol_version": PROTOCOL_VERSION,
+            "task_id": job["task_id"],
+            "input_hash": job["input_hash"],
+            "sequence": control_sequence,
+            "control_kind": kind,
+            "created_at": time.time(),
+            "payload": payload,
+        }
+        mailbox.publish_control(
+            control_sequence,
+            seal_control(
+                value,
+                str(job["result_public_key"]),
+                _required("WORKER_SIGNING_PRIVATE_KEY"),
+            ),
+        )
 
     def write_checkpoint(value: dict[str, Any]) -> None:
         checkpoint_result = {
@@ -145,7 +238,7 @@ def run() -> int:
             "task_id": job["task_id"],
             "job_kind": job["job_kind"],
             "input_hash": job["input_hash"],
-            "pipeline_fingerprint": str(dict(job.get("pipeline") or {}).get("version") or "v1"),
+            "pipeline_fingerprint": str(dict(job.get("pipeline") or {}).get("version") or "v2"),
             "status": "checkpoint",
             "outputs": {"checkpoint": value},
             "metrics": {},
@@ -171,7 +264,9 @@ def run() -> int:
             encoding="utf-8",
         )
         os.replace(temporary_checkpoint, destination)
+        publish_control("checkpoint", {"checkpoint": value})
 
+    publish_control("progress", {"stage": "remote_compute", "percent": 20.0})
     result = process_job(job, checkpoint_writer=write_checkpoint)
     sealed = seal_result(
         result,
@@ -182,6 +277,7 @@ def run() -> int:
     temporary = output.with_suffix(output.suffix + ".tmp")
     temporary.write_text(json.dumps(sealed, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     os.replace(temporary, output)
+    publish_control("progress", {"stage": "result_ready", "percent": 90.0})
     print(f"task={task_id} stage=result_ready", flush=True)
     return 0
 

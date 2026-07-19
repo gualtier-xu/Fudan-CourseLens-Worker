@@ -1,4 +1,4 @@
-"""Read-only encrypted job mailbox backed by private GitHub Issues."""
+"""Encrypted job and control mailbox backed by private GitHub Issues."""
 
 from __future__ import annotations
 
@@ -8,12 +8,12 @@ from typing import Any
 
 import requests
 
-from .protocol import join_envelope, validate_task_id
+from .protocol import chunk_envelope, join_envelope, validate_task_id
 
 API_ROOT = "https://api.github.com"
 ISSUE_LABEL = "courselens-job"
 TITLE_PREFIX = "[courselens-job]"
-_PART_RE = re.compile(r"^part (\d+)/(\d+)\n([A-Za-z0-9+/=]+)$")
+_PART_RE = re.compile(r"^(?:job )?part (\d+)/(\d+)\n([A-Za-z0-9+/=]+)$")
 
 
 class MailboxError(RuntimeError):
@@ -26,12 +26,13 @@ class IssueMailbox:
             raise ValueError("private job repository and token are required")
         self.repo = repo
         self.timeout = timeout
+        self.issue_number: int | None = None
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "Fudan-CourseLens-Worker/1",
+            "X-GitHub-Api-Version": "2026-03-10",
+            "User-Agent": "Fudan-CourseLens-Worker/2",
         })
 
     def _get(self, path: str, *, params=None):
@@ -40,6 +41,18 @@ class IssueMailbox:
         except requests.RequestException as exc:
             raise MailboxError(f"GitHub mailbox request failed: {type(exc).__name__}") from exc
         if response.status_code != 200:
+            request_id = response.headers.get("X-GitHub-Request-Id", "unknown")
+            raise MailboxError(f"GitHub mailbox returned HTTP {response.status_code} ({request_id})")
+        return response.json()
+
+    def _post(self, path: str, *, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            response = self.session.post(
+                f"{API_ROOT}{path}", json=payload, timeout=self.timeout
+            )
+        except requests.RequestException as exc:
+            raise MailboxError(f"GitHub mailbox request failed: {type(exc).__name__}") from exc
+        if response.status_code != 201:
             request_id = response.headers.get("X-GitHub-Request-Id", "unknown")
             raise MailboxError(f"GitHub mailbox returned HTTP {response.status_code} ({request_id})")
         return response.json()
@@ -66,8 +79,9 @@ class IssueMailbox:
         issue = next((item for item in issues if str(item.get("title") or "") == expected_title), None)
         if issue is None:
             raise MailboxError("encrypted job is not available")
+        self.issue_number = int(issue["number"])
         comments = self._get(
-            f"/repos/{self.repo}/issues/{int(issue['number'])}/comments",
+            f"/repos/{self.repo}/issues/{self.issue_number}/comments",
             params={"per_page": 100},
         )
         pieces: dict[int, str] = {}
@@ -84,3 +98,15 @@ class IssueMailbox:
         if total <= 0 or sorted(pieces) != list(range(1, total + 1)):
             raise MailboxError("encrypted job is incomplete")
         return join_envelope(pieces[index] for index in range(1, total + 1))
+
+    def publish_control(self, sequence: int, envelope: dict[str, Any]) -> None:
+        if self.issue_number is None:
+            raise MailboxError("job issue is not available")
+        chunks = chunk_envelope(envelope)
+        for index, chunk in enumerate(chunks, start=1):
+            self._post(
+                f"/repos/{self.repo}/issues/{self.issue_number}/comments",
+                payload={
+                    "body": f"control {int(sequence)} part {index}/{len(chunks)}\n{chunk}"
+                },
+            )

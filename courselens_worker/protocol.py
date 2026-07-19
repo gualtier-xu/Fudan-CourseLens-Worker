@@ -1,4 +1,4 @@
-"""Encrypted job.v1/result.v1 protocol; kept byte-compatible with the client."""
+"""Encrypted job.v2/result.v2/control.v2 protocol shared with the client."""
 
 from __future__ import annotations
 
@@ -14,10 +14,11 @@ from nacl.exceptions import CryptoError
 from nacl.public import PrivateKey, PublicKey, SealedBox
 from nacl.signing import SigningKey
 
-PROTOCOL_VERSION = "1"
-JOB_SCHEMA = "job.v1"
-RESULT_SCHEMA = "result.v1"
-ENVELOPE_SCHEMA = "sealed.v1"
+PROTOCOL_VERSION = "2"
+JOB_SCHEMA = "job.v2"
+RESULT_SCHEMA = "result.v2"
+CONTROL_SCHEMA = "control.v2"
+ENVELOPE_SCHEMA = "sealed.v2"
 _TASK_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -49,6 +50,13 @@ def validate_task_id(task_id: str) -> str:
     if not _TASK_ID_RE.fullmatch(value):
         raise ProtocolError("invalid task id")
     return value
+
+
+def chunk_envelope(envelope: dict[str, Any], *, chunk_chars: int = 48 * 1024) -> list[str]:
+    if chunk_chars < 1024:
+        raise ValueError("chunk size is too small")
+    encoded = _b64e(canonical_json(envelope))
+    return [encoded[index:index + chunk_chars] for index in range(0, len(encoded), chunk_chars)]
 
 
 def join_envelope(chunks: Iterable[str]) -> dict[str, Any]:
@@ -87,7 +95,7 @@ def validate_job(job: dict[str, Any]) -> None:
     validate_task_id(str(job.get("task_id") or ""))
     if str(job.get("protocol_version") or "") != PROTOCOL_VERSION:
         raise ProtocolError("unsupported protocol version")
-    if job.get("job_kind") not in {"echo", "subtitle", "summary"}:
+    if job.get("job_kind") not in {"echo", "subtitle", "summary", "chapters", "learning_pack"}:
         raise ProtocolError("unsupported job kind")
     created = float(job.get("created_at") or 0)
     expires = float(job.get("expires_at") or 0)
@@ -99,6 +107,21 @@ def validate_job(job: dict[str, Any]) -> None:
     result_key = _b64d(str(job.get("result_public_key") or ""), "result public key")
     if len(result_key) != PublicKey.SIZE:
         raise ProtocolError("result public key has the wrong length")
+    payload = job.get("payload") or {}
+    if not isinstance(payload, dict):
+        raise ProtocolError("job payload must be an object")
+    requested = job.get("requested_outputs") or []
+    if not isinstance(requested, list) or any(not isinstance(item, str) for item in requested):
+        raise ProtocolError("requested outputs must be a string list")
+    media = payload.get("media")
+    if media is not None:
+        if not isinstance(media, dict):
+            raise ProtocolError("media must be an object")
+        if float(media.get("start_seconds") or 0) < 0:
+            raise ProtocolError("media start cannot be negative")
+        duration = media.get("duration_seconds")
+        if duration is not None and float(duration) <= 0:
+            raise ProtocolError("media duration must be positive")
     hashable = dict(job)
     expected = str(hashable.pop("input_hash", ""))
     if expected != sha256_hex(canonical_json(hashable)):
@@ -120,6 +143,31 @@ def seal_result(result: dict[str, Any], result_public_key: str, signing_private_
         "schema": ENVELOPE_SCHEMA,
         "encoding": "zstd+sealedbox+base64",
         "task_id": result["task_id"],
+        "protocol_version": PROTOCOL_VERSION,
+        "sha256": sha256_hex(ciphertext),
+        "ciphertext": _b64e(ciphertext),
+        "signature": _b64e(signature),
+    }
+
+
+def seal_control(control: dict[str, Any], result_public_key: str, signing_private_key: str) -> dict[str, Any]:
+    if control.get("schema") != CONTROL_SCHEMA:
+        raise ProtocolError("unsupported control schema")
+    validate_task_id(str(control.get("task_id") or ""))
+    if control.get("control_kind") not in {"progress", "checkpoint", "refresh_request", "cancel_ack"}:
+        raise ProtocolError("unsupported control kind")
+    public = _b64d(result_public_key, "result public key")
+    signing = _b64d(signing_private_key, "signing private key")
+    if len(public) != PublicKey.SIZE or len(signing) != 32:
+        raise ProtocolError("control key has the wrong length")
+    compressed = zstandard.ZstdCompressor(level=9).compress(canonical_json(control))
+    ciphertext = SealedBox(PublicKey(public)).encrypt(compressed)
+    signature = SigningKey(signing).sign(ciphertext).signature
+    return {
+        "schema": ENVELOPE_SCHEMA,
+        "encoding": "zstd+sealedbox+base64",
+        "message_kind": "control",
+        "task_id": control["task_id"],
         "protocol_version": PROTOCOL_VERSION,
         "sha256": sha256_hex(ciphertext),
         "ciphertext": _b64e(ciphertext),

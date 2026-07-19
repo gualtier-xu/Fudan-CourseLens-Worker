@@ -6,6 +6,7 @@ import os
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
@@ -13,7 +14,7 @@ import numpy as np
 import sherpa_onnx
 
 from .formats import normalize_segments
-from .source import ffmpeg_headers, resolve_redirects, safe_headers
+from .source import pinned_curl_command
 
 SAMPLE_RATE = 16_000
 PCM_CHUNK_SECONDS = 10 * 60
@@ -22,6 +23,38 @@ ASR_WINDOW_SECONDS = 30
 
 class ASRError(RuntimeError):
     pass
+
+
+def _probe_duration(source: dict[str, Any]) -> float:
+    curl = subprocess.Popen(
+        pinned_curl_command(source), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=nw=1:nk=1", "-i", "pipe:0",
+            ],
+            stdin=curl.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=120,
+        )
+        if curl.stdout:
+            curl.stdout.close()
+        curl_returncode = curl.wait(timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        curl.kill()
+        curl.wait()
+        raise ASRError("authorized media duration probe timed out")
+    try:
+        duration = float(completed.stdout.strip())
+    except (TypeError, ValueError):
+        duration = 0.0
+    if curl_returncode != 0 or completed.returncode != 0 or duration <= 0:
+        raise ASRError("authorized media duration could not be determined")
+    return duration
 
 
 class RecognizerPool:
@@ -94,17 +127,35 @@ class RecognizerPool:
 
 
 def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, duration: float) -> None:
-    headers = safe_headers(source.get("headers"))
-    url = resolve_redirects(str(source.get("url") or ""), headers)
-    command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
-    if headers:
-        command += ["-headers", ffmpeg_headers(headers)]
-    command += [
-        "-ss", f"{offset:.3f}", "-t", f"{duration:.3f}", "-i", url,
+    curl = subprocess.Popen(
+        pinned_curl_command(source), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    command = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+        "-ss", f"{offset:.3f}", "-t", f"{duration:.3f}",
         "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-y", str(target),
     ]
-    completed = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900)
-    if completed.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+    ffmpeg = subprocess.Popen(
+        command, stdin=curl.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    if curl.stdout:
+        curl.stdout.close()
+    try:
+        ffmpeg_returncode = ffmpeg.wait(timeout=900)
+        if ffmpeg_returncode == 0:
+            curl.terminate()
+        curl_returncode = curl.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        ffmpeg.kill()
+        curl.kill()
+        ffmpeg.wait()
+        curl.wait()
+        target.unlink(missing_ok=True)
+        raise ASRError("authorized media decode timed out")
+    # ffmpeg may intentionally close the pipe after the requested slice, so a
+    # curl broken-pipe status is acceptable when decoded PCM is complete.
+    if ffmpeg_returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+        target.unlink(missing_ok=True)
         raise ASRError("ffmpeg could not decode the authorized media stream")
 
 
@@ -122,10 +173,22 @@ def transcribe(
     mode = str(payload.get("mode") or "standard")
     if mode not in {"fast", "no-proofread", "standard"}:
         raise ASRError("unsupported subtitle mode")
+    start_seconds = float(source.get("start_seconds") or 0)
     duration = float(source.get("duration_seconds") or 0)
+    if duration <= 0:
+        duration = _probe_duration(source) - start_seconds
+    if start_seconds < 0:
+        raise ASRError("media start is invalid")
     if duration <= 0 or duration > 12 * 60 * 60:
         raise ASRError("media duration is missing or outside the supported range")
-    pool = RecognizerPool(sensevoice_dir, firered_dir, threads=4)
+    strategy = str(os.environ.get("COURSELENS_STANDARD_STRATEGY") or "sequential").strip().lower()
+    if strategy not in {"sequential", "parallel"}:
+        strategy = "sequential"
+    recognizer_threads = 2 if mode == "standard" and strategy == "parallel" else 4
+    pool = RecognizerPool(sensevoice_dir, firered_dir, threads=recognizer_threads)
+    if mode == "standard" and strategy == "parallel":
+        pool.get("sensevoice")
+        pool.get("firered")
     prior = dict(payload.get("checkpoint") or {})
     if prior and str(prior.get("mode") or "") != mode:
         raise ASRError("checkpoint subtitle mode does not match the job")
@@ -137,14 +200,30 @@ def transcribe(
     with tempfile.TemporaryDirectory(prefix="courselens-pcm-") as temporary:
         root = Path(temporary)
         for index in range(completed_chunks, total_chunks):
-            offset = index * PCM_CHUNK_SECONDS
-            chunk_duration = min(PCM_CHUNK_SECONDS, duration - offset)
+            relative_offset = index * PCM_CHUNK_SECONDS
+            absolute_offset = start_seconds + relative_offset
+            chunk_duration = min(PCM_CHUNK_SECONDS, duration - relative_offset)
             pcm = root / f"chunk-{index:04d}.f32le"
-            _decode_chunk(source, pcm, offset=offset, duration=chunk_duration)
-            if mode in {"fast", "standard"}:
-                sense_segments.extend(pool.transcribe_pcm(pcm, "sensevoice", offset_seconds=offset))
-            if mode in {"no-proofread", "standard"}:
-                firered_segments.extend(pool.transcribe_pcm(pcm, "firered", offset_seconds=offset))
+            _decode_chunk(source, pcm, offset=absolute_offset, duration=chunk_duration)
+            if mode == "standard" and strategy == "parallel":
+                with ThreadPoolExecutor(max_workers=2, thread_name_prefix="asr") as executor:
+                    sense_future = executor.submit(
+                        pool.transcribe_pcm, pcm, "sensevoice", offset_seconds=absolute_offset
+                    )
+                    fire_future = executor.submit(
+                        pool.transcribe_pcm, pcm, "firered", offset_seconds=absolute_offset
+                    )
+                    sense_segments.extend(sense_future.result())
+                    firered_segments.extend(fire_future.result())
+            else:
+                if mode in {"fast", "standard"}:
+                    sense_segments.extend(
+                        pool.transcribe_pcm(pcm, "sensevoice", offset_seconds=absolute_offset)
+                    )
+                if mode in {"no-proofread", "standard"}:
+                    firered_segments.extend(
+                        pool.transcribe_pcm(pcm, "firered", offset_seconds=absolute_offset)
+                    )
             pcm.unlink(missing_ok=True)
             progress("asr", index + 1, total_chunks)
             if checkpoint is not None:
@@ -189,6 +268,8 @@ def transcribe(
             "duration_seconds": duration,
             "elapsed_seconds": round(time.monotonic() - started, 3),
             "chunks": total_chunks,
-            "threads": 4,
+            "threads_per_model": recognizer_threads,
+            "strategy": strategy if mode == "standard" else "single-model",
+            "start_seconds": start_seconds,
         },
     }

@@ -10,7 +10,14 @@ import zstandard
 from nacl.public import PrivateKey, SealedBox
 from nacl.signing import SigningKey
 
-from courselens_worker.protocol import open_job, seal_result
+from courselens_worker.protocol import (
+    ENVELOPE_SCHEMA,
+    JOB_SCHEMA,
+    PROTOCOL_VERSION,
+    RESULT_SCHEMA,
+    open_job,
+    seal_result,
+)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -19,11 +26,11 @@ class ProtocolTests(unittest.TestCase):
         local = PrivateKey.generate()
         signing = SigningKey.generate()
         job = {
-            "schema": "job.v1", "protocol_version": "1",
+            "schema": JOB_SCHEMA, "protocol_version": PROTOCOL_VERSION,
             "task_id": "0123456789abcdef0123456789abcdef", "job_kind": "echo",
             "created_at": time.time(), "expires_at": time.time() + 300,
             "result_public_key": base64.b64encode(bytes(local.public_key)).decode(),
-            "pipeline": {"version": "test"}, "payload": {},
+            "pipeline": {"version": "test"}, "payload": {}, "requested_outputs": [],
         }
         raw = json.dumps(job, sort_keys=True, separators=(",", ":")).encode()
         job["input_hash"] = hashlib.sha256(raw).hexdigest()
@@ -32,12 +39,12 @@ class ProtocolTests(unittest.TestCase):
         )
         ciphertext = SealedBox(worker.public_key).encrypt(compressed)
         envelope = {
-            "schema": "sealed.v1", "sha256": hashlib.sha256(ciphertext).hexdigest(),
+            "schema": ENVELOPE_SCHEMA, "sha256": hashlib.sha256(ciphertext).hexdigest(),
             "ciphertext": base64.b64encode(ciphertext).decode(),
         }
         opened = open_job(envelope, base64.b64encode(bytes(worker)).decode())
         result = {
-            "schema": "result.v1", "protocol_version": "1", "task_id": job["task_id"],
+            "schema": RESULT_SCHEMA, "protocol_version": PROTOCOL_VERSION, "task_id": job["task_id"],
             "job_kind": "echo", "input_hash": job["input_hash"], "status": "completed",
         }
         sealed = seal_result(

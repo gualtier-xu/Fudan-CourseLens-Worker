@@ -29,7 +29,9 @@ This boundary follows the same responsible-use principle documented by
   proofreading. The two ASR models are never run concurrently.
 - `summary`: optional RapidOCR, then DeepSeek summary and chapter generation.
 
-All inputs and outputs use the versioned `job.v1` / `result.v1` protocol.
+All inputs and outputs use the versioned `job.v2` / `result.v2` protocol. Encrypted
+`control.v2` records provide progress and resumable checkpoints without exposing
+source text or authorized URLs in public logs.
 Inputs are encrypted to the worker's X25519 public key. Results are encrypted
 to a per-job local public key and signed with the worker's Ed25519 key.
 ASR, OCR, proofreading, and summary-map windows emit encrypted checkpoints;
@@ -37,15 +39,20 @@ a replacement workflow resumes only after the last fully verified window.
 
 ## Repository secrets
 
-The `courselens-worker` environment requires:
+Student Worker repositories are created from this repository as a GitHub
+template. The desktop client configures the `courselens-worker` environment;
+students never create a PAT or manually copy a secret.
 
-- `PRIVATE_JOB_REPO_TOKEN`: fine-grained PAT with read-only Issues permission
-  for `gualtier-xu/Fudan-CourseLens-Private`.
+The environment contains:
+
+- `COURSELENS_JOB_TOKEN`: an expiring GitHub App user token. It exists only
+  while a job is active and can access the student's own Worker and encrypted
+  Mailbox repositories.
 - `WORKER_INPUT_PRIVATE_KEY`: base64 X25519 private key.
 - `WORKER_SIGNING_PRIVATE_KEY`: base64 Ed25519 seed.
 
-`PRIVATE_JOB_REPO` is an environment variable, not a secret. Pull-request CI
-uses synthetic fixtures and never receives the production environment.
+`COURSELENS_MAILBOX_REPO` is a repository variable, not a secret. Pull-request
+CI uses synthetic fixtures and never receives the production environment.
 
 ## Local verification
 
