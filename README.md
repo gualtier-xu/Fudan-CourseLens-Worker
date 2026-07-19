@@ -62,6 +62,12 @@ python -m unittest discover -s tests -p 'test_*.py'
 python scripts/check_public_boundary.py
 ```
 
+Maintainers can also dispatch `Synthetic CPU compute smoke`. The workflow
+generates speech inside the runner, loads both pinned ASR models on four CPU
+threads, and reports only segment counts and timings. It uses no repository
+secret, user recording, course source, transcript artifact, or external media
+fixture.
+
 ## License
 
 Apache License 2.0. Model weights are fetched from their upstream projects and

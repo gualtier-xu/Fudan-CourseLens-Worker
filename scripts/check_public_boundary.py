@@ -7,8 +7,13 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CODE_ROOTS = [ROOT / "courselens_worker", ROOT / ".github" / "workflows"]
-CODE_PREFIXES = ("courselens_worker/", ".github/workflows/")
+CODE_ROOTS = [
+    ROOT / "courselens_worker",
+    ROOT / ".github" / "workflows",
+    ROOT / "scripts",
+]
+CODE_PREFIXES = ("courselens_worker/", ".github/workflows/", "scripts/")
+SELF = Path(__file__).resolve()
 FORBIDDEN = {
     "course platform module": re.compile(r"(?:src\.)?api\.(?:icourse|webvpn)", re.I),
     "course URL acquisition": re.compile(r"\b(?:get_video_url|get_sub_info|sign_video_url)\b", re.I),
@@ -40,6 +45,9 @@ def _history_failures() -> list[str]:
             normalized = name.replace("\\", "/")
             if not normalized.startswith(CODE_PREFIXES) or Path(normalized).suffix not in {".py", ".yml", ".yaml", ".sh"}:
                 continue
+            if normalized == "scripts/check_public_boundary.py":
+                # This scanner necessarily contains the forbidden expressions.
+                continue
             content = subprocess.run(
                 ["git", "show", f"{commit}:{normalized}"], cwd=ROOT, check=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
@@ -53,6 +61,8 @@ def main() -> int:
     for code_root in CODE_ROOTS:
         for path in code_root.rglob("*"):
             if path.suffix not in {".py", ".yml", ".yaml", ".sh"}:
+                continue
+            if path.resolve() == SELF:
                 continue
             text = path.read_text(encoding="utf-8")
             failures.extend(_violations(str(path.relative_to(ROOT)), text))
