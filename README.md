@@ -1,26 +1,84 @@
-# Fudan CourseLens Worker
+# Fudan CourseLens 通用 CPU Worker
 
-这是由私有 Fudan CourseLens 客户端为当前 GitHub 账号自动创建和维护的个人 Actions Worker。
+本仓库是 CourseLens 的公开、通用 GitHub Actions 计算模板。它接收用户客户端创建的短时加密任务，生成字幕、OCR、摘要、章节、证据问答等派生学习资料。
 
-## 用途
+它既是公开模板，也是每名用户个人 `Fudan-CourseLens-Worker` 的唯一受信文件来源。个人 Worker 应与客户端固定的 commit/tree 完全一致；不要直接修改个人仓库中的 README、workflow 或代码。
 
-- 只运行当前用户已授权的加密字幕、OCR、摘要和章节任务。
-- 所有输入通过密封盒传输，媒体只进入有界流式解码，不保存原视频或可下载副本。
-- 结果以加密 Artifact 返回；客户端成功导入后删除 Artifact、Issue 密文和临时任务令牌。
-- 不要在此仓库手工添加课程 URL、Cookie、复旦账号、字幕正文、API Key 或媒体文件。
+## 四仓库关系
 
-## 自动维护
+```text
+私有客户端 Fudan-CourseLens-Private
+  ├─ 从本仓库固定 commit/tree 修复个人 Worker
+  ├─ 把密封任务写入个人私有 Mailbox
+  └─ 验签、解密并事务导入个人 Worker 返回的 Artifact
 
-Worker 文件、workflow、协议版本和可信 tree 由私有客户端从公开模板自动校验与修复。发现文件被修改、版本漂移或仓库名称冲突时，客户端会暂停发送媒体授权并提供修复操作。
+本公开模板 Fudan-CourseLens
+  └─ 文件完全复制到个人 Fudan-CourseLens-Worker
 
-不要手工修改 `main`、生产 Environment、workflow 或 secrets。需要更新时，先更新公开模板，再由客户端执行可信版本修复。
+个人 Fudan-CourseLens-Mailbox
+  └─ 只承载密文任务、控制消息和清理状态
+```
 
-## 运行资源
+## 安全边界
 
-生产 Environment 为 `courselens-worker`，包含短期任务令牌、X25519 输入私钥和 Ed25519 签名私钥。Mailbox 仓库名称保存在变量中。Pull Request 只运行合成测试，不访问生产 secrets。
+- 不包含复旦登录、WebVPN、课程发现、课程枚举、URL 签名或学生账号处理。
+- 不提供原视频下载、断点续传、批量抓取、归档或公开媒体 API。
+- 媒体只以 HTTPS 流进入有界解码管道；源容器、PCM、Cookie、URL、字幕正文和 API Key 不写入磁盘、日志或 Artifact。
+- 重定向逐跳校验 HTTPS、公网 IP 和端口；跨域不转发 Cookie、Origin 或 Referer。
+- 响应在进入 FFmpeg 前按 HTTP 类别、Content-Type 和文件魔数做闭集校验；HTML、JSON 和未知媒体安全失败。
+- Pull Request CI 只使用合成数据，无法读取生产 Environment secret。
+- Artifact、Mailbox 密文和短期任务令牌在客户端成功导入并确认清理后删除。
 
-## 数据生命周期
+浏览器拿到可播放字节后无法绝对阻止开发者工具抓取或屏幕录制。CourseLens 的目标是不提供产品下载能力、不泄露上游授权并显著限制批量抓取，不宣称实现 DRM。
 
-任务 Issue 只保存加密分块控制消息；成功导入后评论被删除并关闭 Issue。Artifact 最长保留七天，正常情况下更早删除。仓库日志只允许出现随机任务 ID、阶段、计数、耗时和固定错误码。
+## 处理能力
 
-本仓库不是课程目录、播放器、下载器或通用计算服务。
+- `fast`：SenseVoice INT8。
+- `no-proofread`：FireRedASR2 CTC INT8。
+- `standard`：SenseVoice 粗识别 → FireRedASR2 CTC → 用户授权的 DeepSeek 结合粗识别校对。
+- `summary`：可选 RapidOCR、时间戳摘要和章节。
+- `learning_pack + answer`：仅依据密封的最小证据回答，并原样保留受控 citation ID。
+
+协议为 `job.v2` / `control.v2` / `result.v2`，兼容 v3 外层任务元数据：
+
+- 输入使用 X25519 密封；
+- 结果使用任务一次性公钥加密并由 Ed25519 签名；
+- 客户端校验 task ID、input hash、签名和递增 sequence；
+- 运行阶段、可测量 `completed/total` 和闭集错误码通过签名控制消息传递；
+- 没有可测量总量时不伪造百分比或 ETA。
+
+## 个人 Worker 运维
+
+个人 Worker 由私有客户端自动创建、校验和修复：
+
+- 生产 Environment 固定为 `courselens-worker`；
+- Worker 私钥长期保存在 Environment secret；
+- `COURSELENS_JOB_TOKEN` 只在活动任务租约期间存在；
+- Mailbox 仓库名保存在受管变量中；
+- tree 漂移、workflow 缺失或 Environment 不完整时，客户端停止发送媒体授权。
+
+不要手工修改个人 Worker 的 `main`、Environment、workflow、variables、secrets 或 README。需要升级时先合并本模板的变更，再更新私有客户端固定的 commit/tree，最后使用客户端“一键修复 Worker”。
+
+## 本地验证
+
+```bash
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -p "test_*.py" -q
+python -m compileall -q courselens_worker scripts tests
+python scripts/check_public_boundary.py
+python scripts/check_text_encoding.py
+```
+
+`scripts/check_public_boundary.py` 会扫描当前文件和 Git 历史，阻止复旦登录、课程发现、Cookie、签名 URL、下载器或真实课程数据进入公开仓库。
+
+## 发布规则
+
+1. 所有第三方 Action 固定完整 commit SHA。
+2. 变更通过 Pull Request、公开 CI、协议测试和边界扫描。
+3. 合并后记录新的模板 commit 与 tree digest。
+4. 私有客户端先更新固定 manifest，再允许用户修复个人 Worker。
+5. 未通过 tree 信任校验前，禁止下发短期令牌和媒体授权。
+
+## 许可
+
+本仓库代码采用 Apache License 2.0。模型权重、运行库和外部 API 继续遵循各自上游许可证与使用条款。

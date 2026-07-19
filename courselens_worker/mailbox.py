@@ -27,6 +27,7 @@ class IssueMailbox:
         self.repo = repo
         self.timeout = timeout
         self.issue_number: int | None = None
+        self.status_comment_id: int | None = None
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/vnd.github+json",
@@ -53,6 +54,18 @@ class IssueMailbox:
         except requests.RequestException as exc:
             raise MailboxError(f"GitHub mailbox request failed: {type(exc).__name__}") from exc
         if response.status_code != 201:
+            request_id = response.headers.get("X-GitHub-Request-Id", "unknown")
+            raise MailboxError(f"GitHub mailbox returned HTTP {response.status_code} ({request_id})")
+        return response.json()
+
+    def _patch(self, path: str, *, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            response = self.session.patch(
+                f"{API_ROOT}{path}", json=payload, timeout=self.timeout
+            )
+        except requests.RequestException as exc:
+            raise MailboxError(f"GitHub mailbox request failed: {type(exc).__name__}") from exc
+        if response.status_code != 200:
             request_id = response.headers.get("X-GitHub-Request-Id", "unknown")
             raise MailboxError(f"GitHub mailbox returned HTTP {response.status_code} ({request_id})")
         return response.json()
@@ -109,4 +122,24 @@ class IssueMailbox:
                 payload={
                     "body": f"control {int(sequence)} part {index}/{len(chunks)}\n{chunk}"
                 },
+            )
+
+    def publish_status(self, sequence: int, envelope: dict[str, Any]) -> None:
+        """Create or replace the single encrypted live-status comment."""
+        if self.issue_number is None:
+            raise MailboxError("job issue is not available")
+        chunks = chunk_envelope(envelope)
+        if len(chunks) != 1:
+            raise MailboxError("encrypted status is unexpectedly large")
+        payload = {"body": f"status {int(sequence)}\n{chunks[0]}"}
+        if self.status_comment_id is None:
+            created = self._post(
+                f"/repos/{self.repo}/issues/{self.issue_number}/comments",
+                payload=payload,
+            )
+            self.status_comment_id = int(created["id"])
+        else:
+            self._patch(
+                f"/repos/{self.repo}/issues/comments/{self.status_comment_id}",
+                payload=payload,
             )

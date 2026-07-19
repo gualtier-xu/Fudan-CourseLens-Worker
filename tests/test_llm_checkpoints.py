@@ -1,11 +1,21 @@
 import json
 import unittest
 from unittest.mock import patch
+from unittest.mock import patch
 
-from courselens_worker.llm import create_summary, proofread_segments
+from courselens_worker.llm import answer_question, create_summary, proofread_segments
 
 
 class LLMCheckpointTests(unittest.TestCase):
+    def test_answer_question_rejects_unreferenced_or_empty_evidence(self):
+        self.assertFalse(answer_question("key", query="q", evidence=[])["grounded"])
+
+    def test_answer_question_preserves_only_known_citation_ids(self):
+        with patch("courselens_worker.llm._chat", return_value='{"answer":"回答","grounded":true,"citations":["r1","fake"]}'):
+            value = answer_question("key", query="q", evidence=[{"citation_id": "r1", "text": "证据"}])
+        self.assertTrue(value["grounded"])
+        self.assertEqual(value["citations"], ["r1"])
+
     def test_proofread_resumes_after_completed_window(self):
         source = [
             {"start_ms": index * 1000, "end_ms": (index + 1) * 1000, "text": f"raw-{index}"}

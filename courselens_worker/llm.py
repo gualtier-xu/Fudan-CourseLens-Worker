@@ -1,4 +1,4 @@
-"""DeepSeek-backed proofreading, summary, and chapter derivation."""
+"""DeepSeek-backed proofreading, grounded answers, and summaries."""
 
 from __future__ import annotations
 
@@ -197,3 +197,34 @@ def create_summary(
             "summary": str(item.get("summary") or "").strip(),
         })
     return {"model": MODEL, "markdown": value["markdown"].strip(), "chapters": chapters}
+
+
+def answer_question(
+    api_key: str,
+    *,
+    query: str,
+    evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Answer only from caller-provided evidence and preserve citation IDs."""
+    allowed = [item for item in evidence if isinstance(item, dict) and item.get("citation_id") and item.get("text")]
+    if not allowed:
+        return {"answer": "资料不足，无法根据当前课程资料回答。", "citations": [], "grounded": False}
+    raw = _json_content(_chat(api_key, [
+        {
+            "role": "system",
+            "content": (
+                "你是严谨的课程问答助手。只能依据用户提供的 evidence 回答，禁止补充外部事实。"
+                "输出 JSON 对象，字段为 answer、grounded、citations。citations 只能填写输入中的 citation_id；"
+                "证据不足时 answer 必须为‘资料不足，无法根据当前课程资料回答。’，grounded 为 false。"
+            ),
+        },
+        {"role": "user", "content": json.dumps({"query": str(query), "evidence": allowed}, ensure_ascii=False)},
+    ], max_tokens=4096))
+    if not isinstance(raw, dict) or not isinstance(raw.get("answer"), str) or not isinstance(raw.get("citations"), list):
+        raise LLMError("answer response has an invalid shape")
+    allowed_ids = {str(item["citation_id"]) for item in allowed}
+    citations = [str(value) for value in raw["citations"] if str(value) in allowed_ids]
+    grounded = bool(raw.get("grounded")) and bool(citations)
+    if not grounded:
+        return {"answer": "资料不足，无法根据当前课程资料回答。", "citations": [], "grounded": False}
+    return {"answer": raw["answer"].strip(), "citations": citations[:8], "grounded": True}

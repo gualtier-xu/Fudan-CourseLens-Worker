@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -92,11 +93,88 @@ def _progress(stage: str, completed: int, total: int) -> None:
     print(f"stage={stage} completed={max(0, int(completed))} total={max(0, int(total))}", flush=True)
 
 
+class SignedProgressPublisher:
+    """Publish bounded signed progress without accumulating Issue comments."""
+
+    def __init__(self, publish, *, heartbeat_seconds: float = 15.0):
+        self.publish = publish
+        self.heartbeat_seconds = max(5.0, float(heartbeat_seconds))
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._latest: dict[str, Any] | None = None
+        self._last_sent: dict[str, Any] | None = None
+        self._last_sent_at = 0.0
+        self._thread = threading.Thread(target=self._heartbeat, name="signed-progress", daemon=True)
+        self._thread.start()
+
+    def update(
+        self,
+        stage: str,
+        completed: int | None = None,
+        total: int | None = None,
+        *,
+        status: str = "running",
+        error_code: str = "",
+        force: bool = False,
+    ) -> None:
+        completed_value = max(0, int(completed)) if completed is not None else None
+        total_value = max(0, int(total)) if total is not None else None
+        if completed_value is not None and total_value is not None:
+            _progress(stage, completed_value, total_value)
+        payload = {
+            "stage": str(stage)[:80],
+            "status": str(status) if status in {"running", "waiting", "failed", "completed"} else "running",
+            "completed": completed_value,
+            "total": total_value,
+            "error_code": str(error_code)[:80],
+        }
+        with self._lock:
+            self._latest = payload
+            now = time.monotonic()
+            if force or self._should_send(payload, now):
+                self._send_locked(payload, now)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+
+    def _should_send(self, payload: dict[str, Any], now: float) -> bool:
+        prior = self._last_sent
+        if prior is None or payload["stage"] != prior.get("stage") or payload["status"] != prior.get("status"):
+            return True
+        if now - self._last_sent_at >= self.heartbeat_seconds:
+            return True
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        old_completed = int(prior.get("completed") or 0)
+        return bool(total and completed - old_completed >= max(1, int(total * 0.02)))
+
+    def _send_locked(self, payload: dict[str, Any], now: float) -> None:
+        try:
+            self.publish(dict(payload))
+        except Exception as exc:
+            print(f"status_update_failed type={type(exc).__name__}", file=sys.stderr, flush=True)
+            return
+        self._last_sent = dict(payload)
+        self._last_sent_at = now
+
+    def _heartbeat(self) -> None:
+        while not self._stop.wait(5.0):
+            with self._lock:
+                if self._latest is None:
+                    continue
+                now = time.monotonic()
+                if now - self._last_sent_at >= self.heartbeat_seconds:
+                    self._send_locked(self._latest, now)
+
+
 def process_job(
     job: dict[str, Any],
     *,
     checkpoint_writer=None,
+    progress_callback=None,
 ) -> dict[str, Any]:
+    progress = progress_callback or _progress
     if dict(job.get("payload") or {}).get("source_session"):
         from .platform_session import materialize_job_sources
         job = materialize_job_sources(job)
@@ -123,7 +201,7 @@ def process_job(
                 prior_checkpoint=prior,
                 checkpoint=write,
             )),
-            progress=_progress,
+            progress=progress,
             checkpoint=checkpoint_writer,
         )
         outputs = {
@@ -147,7 +225,7 @@ def process_job(
         prior = dict(payload.get("checkpoint") or {})
         pages = process_slides(
             slides,
-            progress=_progress,
+            progress=progress,
             prior_checkpoint=prior,
             checkpoint=checkpoint_writer,
         ) if slides else list(prior.get("ppt_pages") or [])
@@ -181,7 +259,7 @@ def process_job(
     elif kind == "learning_pack":
         from .asr import transcribe
         from .formats import to_srt, to_vtt
-        from .llm import create_summary, proofread_segments
+        from .llm import answer_question, create_summary, proofread_segments
         from .ocr import process_slides
 
         payload = dict(job.get("payload") or {})
@@ -200,7 +278,7 @@ def process_job(
                 proofread=(lambda sense, fire, saved, write: proofread_segments(
                     api_key, sense, fire, prior_checkpoint=saved, checkpoint=write
                 )),
-                progress=_progress,
+                progress=progress,
                 checkpoint=checkpoint_writer,
             )
             transcript = value["segments"]
@@ -213,10 +291,17 @@ def process_job(
                 "raw_firered": value["raw_firered"],
             }
             metrics["subtitle"] = value["metrics"]
+        if "answer" in requested:
+            outputs["answer"] = answer_question(
+                api_key,
+                query=str(payload.get("query") or ""),
+                evidence=list(payload.get("evidence") or []),
+            )
+            metrics["evidence_count"] = len(payload.get("evidence") or [])
         slides = list(payload.get("slides") or [])
         pages = process_slides(
             slides,
-            progress=_progress,
+            progress=progress,
             prior_checkpoint=prior,
             checkpoint=checkpoint_writer,
         ) if slides and requested.intersection({"ocr", "summary", "chapters"}) else list(prior.get("ppt_pages") or [])
@@ -265,28 +350,31 @@ def run() -> int:
     print(f"task={task_id} stage=processing kind={job['job_kind']}", flush=True)
     checkpoint_root = Path(".work") / "checkpoints"
     control_sequence = 0
+    control_lock = threading.RLock()
 
-    def publish_control(kind: str, payload: dict[str, Any]) -> None:
+    def publish_control(kind: str, payload: dict[str, Any], *, mutable: bool = False) -> None:
         nonlocal control_sequence
-        control_sequence += 1
-        value = {
-            "schema": CONTROL_SCHEMA,
-            "protocol_version": PROTOCOL_VERSION,
-            "task_id": job["task_id"],
-            "input_hash": job["input_hash"],
-            "sequence": control_sequence,
-            "control_kind": kind,
-            "created_at": time.time(),
-            "payload": payload,
-        }
-        mailbox.publish_control(
-            control_sequence,
-            seal_control(
+        with control_lock:
+            control_sequence += 1
+            value = {
+                "schema": CONTROL_SCHEMA,
+                "protocol_version": PROTOCOL_VERSION,
+                "task_id": job["task_id"],
+                "input_hash": job["input_hash"],
+                "sequence": control_sequence,
+                "control_kind": kind,
+                "created_at": time.time(),
+                "payload": payload,
+            }
+            sealed_control = seal_control(
                 value,
                 str(job["result_public_key"]),
                 _required("WORKER_SIGNING_PRIVATE_KEY"),
-            ),
-        )
+            )
+            if mutable:
+                mailbox.publish_status(control_sequence, sealed_control)
+            else:
+                mailbox.publish_control(control_sequence, sealed_control)
 
     def write_checkpoint(value: dict[str, Any]) -> None:
         checkpoint_result = {
@@ -323,8 +411,30 @@ def run() -> int:
         os.replace(temporary_checkpoint, destination)
         publish_control("checkpoint", {"checkpoint": value})
 
-    publish_control("progress", {"stage": "remote_compute", "percent": 20.0})
-    result = process_job(job, checkpoint_writer=write_checkpoint)
+    publisher = SignedProgressPublisher(
+        lambda payload: publish_control("progress", payload, mutable=True)
+    )
+    publisher.update("remote_compute", status="waiting", force=True)
+    try:
+        result = process_job(
+            job,
+            checkpoint_writer=write_checkpoint,
+            progress_callback=lambda stage, completed, total: publisher.update(
+                stage, completed, total, status="running"
+            ),
+        )
+    except Exception as exc:
+        try:
+            error_code = safe_worker_error_detail(exc) or "worker_failed"
+        except Exception:
+            error_code = "worker_failed"
+        publisher.update(
+            "remote_compute", status="failed",
+            error_code=error_code, force=True,
+        )
+        raise
+    finally:
+        publisher.close()
     sealed = seal_result(
         result,
         str(job["result_public_key"]),
@@ -334,7 +444,10 @@ def run() -> int:
     temporary = output.with_suffix(output.suffix + ".tmp")
     temporary.write_text(json.dumps(sealed, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     os.replace(temporary, output)
-    publish_control("progress", {"stage": "result_ready", "percent": 90.0})
+    publish_control("progress", {
+        "stage": "result", "status": "completed", "completed": 1,
+        "total": 1, "error_code": "",
+    }, mutable=True)
     print(f"task={task_id} stage=result_ready", flush=True)
     return 0
 
