@@ -63,10 +63,10 @@ python scripts/check_public_boundary.py
 ```
 
 Maintainers can also dispatch `Synthetic CPU compute smoke`. The workflow
-generates speech inside the runner, loads both pinned ASR models on four CPU
-threads, and reports only segment counts and timings. It uses no repository
-secret, user recording, course source, transcript artifact, or external media
-fixture.
+generates speech and a duplicate slide pair inside the runner, loads both
+pinned ASR models and RapidOCR, verifies slide deduplication/checkpointing, and
+reports only counts and timings. It uses no repository secret, user recording,
+course source, transcript artifact, or external media fixture.
 
 ## License
 
