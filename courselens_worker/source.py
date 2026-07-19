@@ -7,8 +7,10 @@ import http.client
 import http.server
 import re
 import secrets
+import selectors
 import ssl
 import socket
+import socketserver
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -232,6 +234,129 @@ class PinnedMediaProxy:
         return str(self._server.failure_code or "")
 
 
+class _PinnedConnectServer(socketserver.ThreadingTCPServer):
+    """Loopback-only CONNECT proxy fixed to one validated upstream address."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, resolved: ResolvedSource):
+        parsed = urlsplit(resolved.url)
+        self.allowed_host = str(parsed.hostname or "").casefold()
+        self.pinned_ip = resolved.ip
+        self.failure_code = ""
+        super().__init__(("127.0.0.1", 0), _PinnedConnectHandler)
+
+
+@dataclass(frozen=True)
+class PinnedConnectProxy:
+    proxy_url: str
+    source_url: str
+    headers: dict[str, str]
+    _server: _PinnedConnectServer
+
+    @property
+    def failure_code(self) -> str:
+        return str(self._server.failure_code or "")
+
+
+def _connect_pinned_upstream(ip: str) -> socket.socket:
+    return socket.create_connection((ip, 443), timeout=30)
+
+
+class _PinnedConnectHandler(socketserver.BaseRequestHandler):
+    server: _PinnedConnectServer
+
+    def handle(self) -> None:
+        client = self.request
+        upstream: socket.socket | None = None
+        try:
+            client.settimeout(30)
+            request = bytearray()
+            while b"\r\n\r\n" not in request and len(request) <= 16 * 1024:
+                block = client.recv(4096)
+                if not block:
+                    return
+                request.extend(block)
+            if b"\r\n\r\n" not in request or len(request) > 16 * 1024:
+                self.server.failure_code = "invalid_connect"
+                self._reject(400)
+                return
+            header, initial = bytes(request).split(b"\r\n\r\n", 1)
+            try:
+                first_line = header.split(b"\r\n", 1)[0].decode("ascii")
+                method, authority, version = first_line.split(" ", 2)
+                parsed = urlsplit(f"//{authority}")
+                port = parsed.port
+            except (UnicodeDecodeError, ValueError):
+                self.server.failure_code = "invalid_connect"
+                self._reject(400)
+                return
+            if (
+                method != "CONNECT"
+                or version not in {"HTTP/1.0", "HTTP/1.1"}
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or port != 443
+            ):
+                self.server.failure_code = "invalid_connect"
+                self._reject(400)
+                return
+            if str(parsed.hostname).casefold() != self.server.allowed_host:
+                self.server.failure_code = "target_mismatch"
+                self._reject(403)
+                return
+            try:
+                upstream = _connect_pinned_upstream(self.server.pinned_ip)
+            except OSError:
+                self.server.failure_code = "upstream_connection_failed"
+                self._reject(502)
+                return
+            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            if initial:
+                upstream.sendall(initial)
+            self._relay(client, upstream)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            return
+        finally:
+            if upstream is not None:
+                upstream.close()
+
+    def _reject(self, status: int) -> None:
+        reason = {400: "Bad Request", 403: "Forbidden", 502: "Bad Gateway"}.get(status, "Error")
+        try:
+            self.request.sendall(
+                f"HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".encode("ascii")
+            )
+        except OSError:
+            return
+
+    @staticmethod
+    def _relay(client: socket.socket, upstream: socket.socket) -> None:
+        # Reading is readiness-driven; blocking writes provide backpressure and
+        # avoid dropping large TLS records when a nonblocking send is partial.
+        client.settimeout(None)
+        upstream.settimeout(None)
+        selector = selectors.DefaultSelector()
+        selector.register(client, selectors.EVENT_READ, upstream)
+        selector.register(upstream, selectors.EVENT_READ, client)
+        try:
+            while True:
+                events = selector.select(timeout=120)
+                if not events:
+                    return
+                for key, _ in events:
+                    source = key.fileobj
+                    destination = key.data
+                    block = source.recv(64 * 1024)
+                    if not block:
+                        return
+                    destination.sendall(block)
+        finally:
+            selector.close()
+
+
 class _PinnedRangeHandler(http.server.BaseHTTPRequestHandler):
     server: _PinnedRangeProxy
 
@@ -337,6 +462,38 @@ def pinned_media_proxy(source: dict[str, Any]) -> Iterator[PinnedMediaProxy]:
         yield PinnedMediaProxy(
             f"http://127.0.0.1:{server.server_port}{path}",
             server,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@contextmanager
+def pinned_connect_proxy(source: dict[str, Any]) -> Iterator[PinnedConnectProxy]:
+    """Give FFmpeg a transient CONNECT tunnel to one validated HTTPS host.
+
+    FFmpeg keeps end-to-end TLS with the original hostname and performs its own
+    Range requests. The proxy accepts only that hostname on port 443, connects
+    only to the validated public IP, and never inspects or stores media bytes.
+    """
+    headers = safe_headers(source.get("headers"))
+    source_url = str(source.get("url") or "")
+    public_ip_hint = str(source.get("resolved_public_ip") or "")
+    if public_ip_hint:
+        validated_url, validated_ip = _validate_and_resolve(source_url, public_ip_hint)
+        resolved = ResolvedSource(validated_url, headers, validated_ip)
+    else:
+        resolved = resolve_source(source_url, headers)
+    server = _PinnedConnectServer(resolved)
+    thread = threading.Thread(target=server.serve_forever, name="courselens-connect-proxy", daemon=True)
+    thread.start()
+    try:
+        yield PinnedConnectProxy(
+            proxy_url=f"http://127.0.0.1:{server.server_address[1]}",
+            source_url=resolved.url,
+            headers=dict(resolved.headers),
+            _server=server,
         )
     finally:
         server.shutdown()

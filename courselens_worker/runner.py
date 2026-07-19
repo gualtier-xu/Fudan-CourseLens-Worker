@@ -46,6 +46,8 @@ _ASR_ERROR_CODES = {
     "authorized media format was rejected by ffmpeg": "media_format_rejected",
     "authorized media request returned an unsupported redirect": "media_redirect_rejected",
     "authorized media upstream connection failed": "media_connection_failed",
+    "authorized media proxy target was rejected": "media_proxy_target_rejected",
+    "authorized media proxy request was rejected": "media_proxy_request_rejected",
     "ffmpeg requested an invalid media range": "media_range_invalid",
 }
 

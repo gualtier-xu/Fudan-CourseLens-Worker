@@ -14,7 +14,7 @@ import numpy as np
 import sherpa_onnx
 
 from .formats import normalize_segments
-from .source import pinned_media_proxy
+from .source import ffmpeg_headers, pinned_connect_proxy
 
 SAMPLE_RATE = 16_000
 PCM_CHUNK_SECONDS = 10 * 60
@@ -47,11 +47,12 @@ def _decode_failure(stderr: str) -> ASRError:
 
 def _probe_duration(source: dict[str, Any]) -> float:
     try:
-        with pinned_media_proxy(source) as proxy:
+        with pinned_connect_proxy(source) as proxy:
             completed = subprocess.run(
                 [
                     "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                    "-of", "default=nw=1:nk=1", proxy.url,
+                    "-of", "default=nw=1:nk=1", "-http_proxy", proxy.proxy_url,
+                    "-headers", ffmpeg_headers(proxy.headers), proxy.source_url,
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -141,11 +142,13 @@ class RecognizerPool:
 def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, duration: float) -> None:
     proxy_failure = ""
     try:
-        with pinned_media_proxy(source) as proxy:
+        with pinned_connect_proxy(source) as proxy:
             completed = subprocess.run(
                 [
                     "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                    "-ss", f"{offset:.3f}", "-i", proxy.url, "-t", f"{duration:.3f}",
+                    "-http_proxy", proxy.proxy_url,
+                    "-headers", ffmpeg_headers(proxy.headers),
+                    "-ss", f"{offset:.3f}", "-i", proxy.source_url, "-t", f"{duration:.3f}",
                     "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le",
                     "-y", str(target),
                 ],
@@ -168,6 +171,8 @@ def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, durati
             "upstream_http_5xx": "authorized media request returned HTTP 5xx",
             "upstream_redirect": "authorized media request returned an unsupported redirect",
             "upstream_connection_failed": "authorized media upstream connection failed",
+            "target_mismatch": "authorized media proxy target was rejected",
+            "invalid_connect": "authorized media proxy request was rejected",
             "invalid_range": "ffmpeg requested an invalid media range",
         }
         if proxy_failure in proxy_messages:

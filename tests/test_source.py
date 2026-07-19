@@ -8,6 +8,7 @@ from unittest.mock import Mock, call, patch
 from courselens_worker.source import (
     SourceSecurityError,
     _PinnedHTTPSConnection,
+    pinned_connect_proxy,
     pinned_media_proxy,
     resolve_source,
     safe_headers,
@@ -132,6 +133,44 @@ class SourceSecurityTests(unittest.TestCase):
                 urllib.request.urlopen(probe, timeout=5)
             self.assertEqual(proxy.failure_code, "upstream_http_403")
             self.assertNotIn("secret", proxy.failure_code)
+
+    @patch("courselens_worker.source._connect_pinned_upstream")
+    def test_connect_proxy_pins_target_and_tunnels_without_inspecting_bytes(self, connect):
+        proxy_upstream, test_upstream = socket.socketpair()
+        connect.return_value = proxy_upstream
+        source = {
+            "url": "https://media.example.com/video?secret=value",
+            "headers": {"Cookie": "secret"},
+            "resolved_public_ip": "93.184.216.34",
+        }
+        try:
+            with pinned_connect_proxy(source) as proxy:
+                with socket.create_connection(("127.0.0.1", int(proxy.proxy_url.rsplit(":", 1)[1]))) as client:
+                    client.sendall(
+                        b"CONNECT media.example.com:443 HTTP/1.1\r\nHost: media.example.com:443\r\n\r\n"
+                    )
+                    self.assertTrue(client.recv(256).startswith(b"HTTP/1.1 200"))
+                    client.sendall(b"opaque-tls-bytes")
+                    self.assertEqual(test_upstream.recv(256), b"opaque-tls-bytes")
+                    test_upstream.sendall(b"opaque-response")
+                    self.assertEqual(client.recv(256), b"opaque-response")
+                self.assertEqual(proxy.failure_code, "")
+        finally:
+            test_upstream.close()
+        connect.assert_called_once_with("93.184.216.34")
+
+    @patch("courselens_worker.source._connect_pinned_upstream")
+    def test_connect_proxy_rejects_any_other_hostname(self, connect):
+        source = {
+            "url": "https://media.example.com/video",
+            "resolved_public_ip": "93.184.216.34",
+        }
+        with pinned_connect_proxy(source) as proxy:
+            with socket.create_connection(("127.0.0.1", int(proxy.proxy_url.rsplit(":", 1)[1]))) as client:
+                client.sendall(b"CONNECT other.example.com:443 HTTP/1.1\r\n\r\n")
+                self.assertTrue(client.recv(256).startswith(b"HTTP/1.1 403"))
+            self.assertEqual(proxy.failure_code, "target_mismatch")
+        connect.assert_not_called()
 
     @patch("courselens_worker.source._request_once")
     @patch("courselens_worker.source.socket.getaddrinfo")
