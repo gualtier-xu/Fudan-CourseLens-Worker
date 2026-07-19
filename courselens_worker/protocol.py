@@ -122,6 +122,21 @@ def validate_job(job: dict[str, Any]) -> None:
         duration = media.get("duration_seconds")
         if duration is not None and float(duration) <= 0:
             raise ProtocolError("media duration must be positive")
+    source_session = payload.get("source_session")
+    if source_session is not None:
+        if not isinstance(source_session, dict) or source_session.get("provider") != "runner-session-v1":
+            raise ProtocolError("source session provider is unsupported")
+        if not str(source_session.get("course_id") or "").isdigit():
+            raise ProtocolError("source session course id is invalid")
+        if not str(source_session.get("sub_id") or "").isdigit():
+            raise ProtocolError("source session lecture id is invalid")
+        if not (bool(source_session.get("media")) or bool(source_session.get("slides"))):
+            raise ProtocolError("source session requested no resources")
+        credentials = dict(dict(job.get("secrets") or {}).get("source_credentials") or {})
+        account = str(credentials.get("account") or "")
+        password = str(credentials.get("password") or "")
+        if not account or len(account) > 64 or not password or len(password) > 512:
+            raise ProtocolError("source session credentials are invalid")
     hashable = dict(job)
     expected = str(hashable.pop("input_hash", ""))
     if expected != sha256_hex(canonical_json(hashable)):

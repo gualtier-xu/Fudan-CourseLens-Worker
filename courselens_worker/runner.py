@@ -65,6 +65,17 @@ def safe_worker_error_detail(error: BaseException) -> str:
         return safe_source_error_code(error)
     if type(error).__name__ == "ASRError":
         return _ASR_ERROR_CODES.get(str(error), "asr_error")
+    if type(error).__name__ == "PlatformSessionError":
+        value = str(error)
+        return value if value in {
+            "platform_credentials_missing", "platform_connection_failed",
+            "platform_redirect_rejected", "platform_auth_context_missing",
+            "platform_auth_method_missing", "platform_key_rejected",
+            "platform_auth_failed", "platform_ticket_missing",
+            "platform_ticket_rejected", "platform_session_rejected",
+            "platform_course_context_missing", "platform_course_request_failed",
+            "platform_media_missing",
+        } else "platform_session_failed"
     return ""
 
 
@@ -86,6 +97,9 @@ def process_job(
     *,
     checkpoint_writer=None,
 ) -> dict[str, Any]:
+    if dict(job.get("payload") or {}).get("source_session"):
+        from .platform_session import materialize_job_sources
+        job = materialize_job_sources(job)
     kind = str(job["job_kind"])
     started = time.monotonic()
     if kind == "echo":

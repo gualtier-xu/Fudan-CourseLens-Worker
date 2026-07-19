@@ -55,6 +55,38 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("signature", sealed)
         self.assertNotIn(job["task_id"], sealed["ciphertext"])
 
+    def test_runner_source_session_requires_encrypted_credentials(self):
+        worker = PrivateKey.generate()
+        local = PrivateKey.generate()
+        job = {
+            "schema": JOB_SCHEMA, "protocol_version": PROTOCOL_VERSION,
+            "task_id": "fedcba9876543210fedcba9876543210", "job_kind": "subtitle",
+            "created_at": time.time(), "expires_at": time.time() + 300,
+            "result_public_key": base64.b64encode(bytes(local.public_key)).decode(),
+            "pipeline": {"version": "test"}, "requested_outputs": ["subtitle"],
+            "payload": {
+                "mode": "fast", "media": {"start_seconds": 600, "duration_seconds": 300},
+                "source_session": {
+                    "provider": "runner-session-v1", "course_id": "36941",
+                    "sub_id": "652577", "media": True, "slides": False,
+                },
+            },
+            "secrets": {"source_credentials": {"account": "synthetic", "password": "synthetic"}},
+        }
+        raw = json.dumps(job, sort_keys=True, separators=(",", ":")).encode()
+        job["input_hash"] = hashlib.sha256(raw).hexdigest()
+        compressed = zstandard.ZstdCompressor().compress(
+            json.dumps(job, sort_keys=True, separators=(",", ":")).encode()
+        )
+        ciphertext = SealedBox(worker.public_key).encrypt(compressed)
+        envelope = {
+            "schema": ENVELOPE_SCHEMA, "sha256": hashlib.sha256(ciphertext).hexdigest(),
+            "ciphertext": base64.b64encode(ciphertext).decode(),
+        }
+        opened = open_job(envelope, base64.b64encode(bytes(worker)).decode())
+        self.assertEqual(opened["payload"]["source_session"]["sub_id"], "652577")
+        self.assertNotIn("synthetic", str(envelope))
+
 
 if __name__ == "__main__":
     unittest.main()

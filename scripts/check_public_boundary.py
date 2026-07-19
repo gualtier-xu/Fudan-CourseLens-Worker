@@ -21,10 +21,24 @@ FORBIDDEN = {
     "student credential": re.compile(r"\b(?:student_id|UISPsw|StuId)\b"),
     "platform host": re.compile(r"(?:icourse|webvpn)[-\.][a-z0-9.-]+", re.I),
 }
+PLATFORM_CONNECTOR = "courselens_worker/platform_session.py"
 
 
 def _violations(label: str, text: str) -> list[str]:
-    return [f"{label}: {name}" for name, pattern in FORBIDDEN.items() if pattern.search(text)]
+    normalized = label.replace("\\", "/")
+    connector = normalized.endswith(PLATFORM_CONNECTOR)
+    failures = []
+    for name, pattern in FORBIDDEN.items():
+        if connector and name in {
+            "course platform module", "course URL acquisition",
+            "student credential", "platform host",
+        }:
+            continue
+        if pattern.search(text):
+            failures.append(f"{label}: {name}")
+    if connector and re.search(r"\b(?:write_bytes|NamedTemporaryFile|mkstemp)\b", text):
+        failures.append(f"{label}: connector persistence")
+    return failures
 
 
 def _history_failures() -> list[str]:

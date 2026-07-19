@@ -7,11 +7,17 @@ and chapters.
 
 ## Important boundary
 
-This repository **does not** contain course discovery, account login, WebVPN,
-course-platform APIs, URL signing, original-video saving, resumable media
-transfer, batch acquisition, or media archiving. It cannot obtain a course
-source by itself. The worker accepts only an encrypted job created by the
-user's local private application after a runner has started.
+This repository contains one narrowly scoped session connector. When the user
+and platform have explicitly authorized runner-side authentication, it may
+establish a one-job in-memory session and authorize only the requested lecture
+and slide sources. Credentials arrive inside the encrypted job and are not
+stored as a long-lived Actions secret.
+
+The repository **does not** expose course discovery, original-video saving,
+resumable media transfer, batch acquisition, or media archiving. The connector
+has no original-media persistence API, and the worker still accepts only an
+encrypted job created by the user's local private application after a runner
+has started.
 
 The media input is decoded directly into bounded mono PCM chunks. Encoded
 source containers are never written to disk or uploaded as artifacts. Only an
