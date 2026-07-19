@@ -406,7 +406,11 @@ class PlatformSession:
         if not base or not urlparse(base).path.lower().endswith(".mp4"):
             raise _fail("platform_media_missing")
         signed = self._sign(base, int(info.get("now") or 0) or None)
-        return {"url": signed, "headers": self._source_headers()}
+        # Keep authorization and the media stream on the same runner-side
+        # WebVPN session.  The upstream CDN name is not guaranteed to resolve
+        # from GitHub-hosted runners, and a direct request would also bypass
+        # the session whose egress address was used to mint the signature.
+        return {"url": _vpn_url(signed), "headers": self._source_headers()}
 
     def slide_sources(self, course_id: str, sub_id: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []

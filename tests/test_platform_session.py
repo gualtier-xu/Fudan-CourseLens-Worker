@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 from courselens_worker.platform_session import (
+    PlatformSession,
     PlatformSessionError,
     _validate_url,
     materialize_job_sources,
@@ -56,6 +58,23 @@ class PlatformSessionTests(unittest.TestCase):
         self.assertNotIn("source_credentials", result["secrets"])
         self.assertEqual(result["payload"]["media"]["start_seconds"], 600)
         self.assertEqual(len(result["payload"]["slides"]), 1)
+
+    def test_media_source_stays_inside_runner_webvpn_session(self):
+        connector = object.__new__(PlatformSession)
+        connector._course_json = lambda *_args, **_kwargs: {
+            "data": {
+                "now": 1,
+                "video_list": {
+                    "main": {"preview_url": "https://media.example.edu/lecture.mp4"}
+                },
+            }
+        }
+        connector._sign = lambda value, _now: value + "?clientUUID=test&t=test"
+        connector._source_headers = lambda: {"Cookie": "sealed"}
+        source = connector.media_source("1", "2")
+        parsed = urlsplit(source["url"])
+        self.assertEqual(parsed.hostname, "webvpn.fudan.edu.cn")
+        self.assertIn("clientUUID=test", parsed.query)
 
 
 if __name__ == "__main__":
