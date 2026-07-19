@@ -218,7 +218,18 @@ class _PinnedRangeProxy(http.server.ThreadingHTTPServer):
     def __init__(self, resolved: ResolvedSource, path: str):
         self.resolved = resolved
         self.media_path = path
+        self.failure_code = ""
         super().__init__(("127.0.0.1", 0), _PinnedRangeHandler)
+
+
+@dataclass(frozen=True)
+class PinnedMediaProxy:
+    url: str
+    _server: _PinnedRangeProxy
+
+    @property
+    def failure_code(self) -> str:
+        return str(self._server.failure_code or "")
 
 
 class _PinnedRangeHandler(http.server.BaseHTTPRequestHandler):
@@ -239,6 +250,7 @@ class _PinnedRangeHandler(http.server.BaseHTTPRequestHandler):
             return
         range_header = str(self.headers.get("Range") or "").strip()
         if range_header and not _SINGLE_RANGE.fullmatch(range_header):
+            self.server.failure_code = "invalid_range"
             self.send_error(416)
             return
         resolved = self.server.resolved
@@ -256,6 +268,14 @@ class _PinnedRangeHandler(http.server.BaseHTTPRequestHandler):
             )
             status = int(response.status)
             if status not in {200, 206, 416}:
+                if status in {301, 302, 303, 307, 308}:
+                    self.server.failure_code = "upstream_redirect"
+                elif status in {401, 403, 404, 429}:
+                    self.server.failure_code = f"upstream_http_{status}"
+                elif 500 <= status <= 599:
+                    self.server.failure_code = "upstream_http_5xx"
+                else:
+                    self.server.failure_code = "upstream_http_other"
                 self.send_error(status if 400 <= status <= 599 else 502)
                 return
             self.send_response(status)
@@ -276,6 +296,7 @@ class _PinnedRangeHandler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception:
+            self.server.failure_code = "upstream_connection_failed"
             try:
                 self.send_error(502)
             except (BrokenPipeError, ConnectionResetError):
@@ -288,7 +309,7 @@ class _PinnedRangeHandler(http.server.BaseHTTPRequestHandler):
 
 
 @contextmanager
-def pinned_media_proxy(source: dict[str, Any]) -> Iterator[str]:
+def pinned_media_proxy(source: dict[str, Any]) -> Iterator[PinnedMediaProxy]:
     """Expose one validated source as a loopback-only, transient Range URL.
 
     FFmpeg needs random-access Range requests for many MP4 files.  The proxy
@@ -313,7 +334,10 @@ def pinned_media_proxy(source: dict[str, Any]) -> Iterator[str]:
     thread = threading.Thread(target=server.serve_forever, name="courselens-range-proxy", daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_port}{path}"
+        yield PinnedMediaProxy(
+            f"http://127.0.0.1:{server.server_port}{path}",
+            server,
+        )
     finally:
         server.shutdown()
         server.server_close()

@@ -47,11 +47,11 @@ def _decode_failure(stderr: str) -> ASRError:
 
 def _probe_duration(source: dict[str, Any]) -> float:
     try:
-        with pinned_media_proxy(source) as media_url:
+        with pinned_media_proxy(source) as proxy:
             completed = subprocess.run(
                 [
                     "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                    "-of", "default=nw=1:nk=1", media_url,
+                    "-of", "default=nw=1:nk=1", proxy.url,
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -139,12 +139,13 @@ class RecognizerPool:
 
 
 def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, duration: float) -> None:
+    proxy_failure = ""
     try:
-        with pinned_media_proxy(source) as media_url:
+        with pinned_media_proxy(source) as proxy:
             completed = subprocess.run(
                 [
                     "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                    "-ss", f"{offset:.3f}", "-i", media_url, "-t", f"{duration:.3f}",
+                    "-ss", f"{offset:.3f}", "-i", proxy.url, "-t", f"{duration:.3f}",
                     "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le",
                     "-y", str(target),
                 ],
@@ -153,11 +154,24 @@ def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, durati
                 text=True,
                 timeout=900,
             )
+            proxy_failure = proxy.failure_code
     except subprocess.TimeoutExpired:
         target.unlink(missing_ok=True)
         raise ASRError("authorized media decode timed out")
     if completed.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
         target.unlink(missing_ok=True)
+        proxy_messages = {
+            "upstream_http_401": "authorized media request returned HTTP 401",
+            "upstream_http_403": "authorized media request returned HTTP 403",
+            "upstream_http_404": "authorized media request returned HTTP 404",
+            "upstream_http_429": "authorized media request returned HTTP 429",
+            "upstream_http_5xx": "authorized media request returned HTTP 5xx",
+            "upstream_redirect": "authorized media request returned an unsupported redirect",
+            "upstream_connection_failed": "authorized media upstream connection failed",
+            "invalid_range": "ffmpeg requested an invalid media range",
+        }
+        if proxy_failure in proxy_messages:
+            raise ASRError(proxy_messages[proxy_failure])
         raise _decode_failure(completed.stderr)
 
 

@@ -108,15 +108,30 @@ class SourceSecurityTests(unittest.TestCase):
             "headers": {"User-Agent": "CourseLens"},
             "resolved_public_ip": "93.184.216.34",
         }
-        with pinned_media_proxy(source) as local_url:
-            self.assertTrue(local_url.startswith("http://127.0.0.1:"))
-            probe = urllib.request.Request(local_url, headers={"Range": "bytes=10-13"})
+        with pinned_media_proxy(source) as proxy:
+            self.assertTrue(proxy.url.startswith("http://127.0.0.1:"))
+            probe = urllib.request.Request(proxy.url, headers={"Range": "bytes=10-13"})
             with urllib.request.urlopen(probe, timeout=5) as response:
                 self.assertEqual(response.status, 206)
                 self.assertEqual(response.read(), b"test")
+            self.assertEqual(proxy.failure_code, "")
         self.assertEqual(request.call_count, 1)
         self.assertEqual(request.call_args.args[2], "93.184.216.34")
         self.assertEqual(request.call_args.args[1]["Range"], "bytes=10-13")
+
+    @patch("courselens_worker.source._request_once")
+    def test_loopback_proxy_records_only_a_fixed_upstream_failure_code(self, request):
+        request.return_value = (Mock(), FakeResponse(403))
+        source = {
+            "url": "https://media.example.com/video?secret=value",
+            "resolved_public_ip": "93.184.216.34",
+        }
+        with pinned_media_proxy(source) as proxy:
+            probe = urllib.request.Request(proxy.url, headers={"Range": "bytes=0-0"})
+            with self.assertRaises(Exception):
+                urllib.request.urlopen(probe, timeout=5)
+            self.assertEqual(proxy.failure_code, "upstream_http_403")
+            self.assertNotIn("secret", proxy.failure_code)
 
     @patch("courselens_worker.source._request_once")
     @patch("courselens_worker.source.socket.getaddrinfo")

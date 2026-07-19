@@ -44,6 +44,9 @@ _ASR_ERROR_CODES = {
     "authorized media request returned HTTP 5xx": "media_http_5xx",
     "authorized media is missing a readable MP4 index": "media_index_unreadable",
     "authorized media format was rejected by ffmpeg": "media_format_rejected",
+    "authorized media request returned an unsupported redirect": "media_redirect_rejected",
+    "authorized media upstream connection failed": "media_connection_failed",
+    "ffmpeg requested an invalid media range": "media_range_invalid",
 }
 
 
