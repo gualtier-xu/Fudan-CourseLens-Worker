@@ -13,6 +13,8 @@ CODE_ROOTS = [
     ROOT / "scripts",
 ]
 CODE_PREFIXES = ("courselens_worker/", ".github/workflows/", "scripts/")
+DOC_ROOTS = [ROOT / "README.md", ROOT / "docs"]
+DOC_PREFIXES = ("README.md", "docs/")
 SELF = Path(__file__).resolve()
 FORBIDDEN = {
     "course platform module": re.compile(r"(?:src\.)?api\.(?:icourse|webvpn)", re.I),
@@ -22,6 +24,17 @@ FORBIDDEN = {
     "platform host": re.compile(r"(?:icourse|webvpn)[-\.][a-z0-9.-]+", re.I),
 }
 PLATFORM_CONNECTOR = "courselens_worker/platform_session.py"
+DOC_FORBIDDEN = {
+    "platform host": re.compile(r"(?:icourse|webvpn)[-\.][a-z0-9.-]+", re.I),
+    "credential example": re.compile(
+        r"\b(?:student[_ -]?id|password|api[_ -]?key|token)\s*[:=]\s*[^\s`]{4,}",
+        re.I,
+    ),
+    "direct media URL": re.compile(r"https?://\S+\.(?:mp4|m3u8|ts)(?:\?\S*)?", re.I),
+    "media download command": re.compile(
+        r"\b(?:curl|wget|yt-dlp)\b[^\n]*(?:mp4|m3u8|media|video)", re.I,
+    ),
+}
 
 
 def _violations(label: str, text: str) -> list[str]:
@@ -39,6 +52,14 @@ def _violations(label: str, text: str) -> list[str]:
     if connector and re.search(r"\b(?:write_bytes|NamedTemporaryFile|mkstemp)\b", text):
         failures.append(f"{label}: connector persistence")
     return failures
+
+
+def _doc_violations(label: str, text: str) -> list[str]:
+    return [
+        f"{label}: {name}"
+        for name, pattern in DOC_FORBIDDEN.items()
+        if pattern.search(text)
+    ]
 
 
 def _history_failures() -> list[str]:
@@ -67,6 +88,15 @@ def _history_failures() -> list[str]:
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
             ).stdout
             failures.extend(_violations(f"history {commit[:12]}:{normalized}", content))
+        for name in names:
+            normalized = name.replace("\\", "/")
+            if not normalized.startswith(DOC_PREFIXES) or Path(normalized).suffix != ".md":
+                continue
+            content = subprocess.run(
+                ["git", "show", f"{commit}:{normalized}"], cwd=ROOT, check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+            ).stdout
+            failures.extend(_doc_violations(f"history {commit[:12]}:{normalized}", content))
     return failures
 
 
@@ -80,6 +110,16 @@ def main() -> int:
                 continue
             text = path.read_text(encoding="utf-8")
             failures.extend(_violations(str(path.relative_to(ROOT)), text))
+    for doc_root in DOC_ROOTS:
+        if doc_root.is_file():
+            candidates = [doc_root]
+        elif doc_root.exists():
+            candidates = doc_root.rglob("*.md")
+        else:
+            candidates = []
+        for path in candidates:
+            text = path.read_text(encoding="utf-8")
+            failures.extend(_doc_violations(str(path.relative_to(ROOT)), text))
     failures.extend(_history_failures())
     if failures:
         print("Public boundary violations:")
