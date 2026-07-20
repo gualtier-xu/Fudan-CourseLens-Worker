@@ -41,7 +41,7 @@
 | `ci.yml` | 单元测试、编译和公共边界检查 | 不读取生产 Secrets |
 | `echo.yml` | 加密通道、签名、Artifact 和清理验证 | 不处理课程媒体 |
 | `process.yml` | 客户端主动派发的派生计算 | 每任务短期令牌、受管并发 |
-| `cloud-verify.yml` | 验证平台登录、DeepSeek 和已启用 SMTP | 不生成课程资料 |
+| `cloud-verify.yml` | 验证平台登录和 DeepSeek | 不生成课程资料 |
 | `cloud-daily.yml` | 默认关闭的云端每日发现与处理 | job-level 时间条件、单用户并发 |
 | `synthetic-smoke.yml` | 合成 ASR/OCR 冒烟测试 | 仅合成输入 |
 
@@ -65,7 +65,7 @@
 
 `cloud-daily.yml` 使用固定半小时 cron 集合，并通过 job-level 条件只在用户选定的北京时间分配 runner。新课程默认仅发现；字幕、OCR、摘要和章节必须按课程显式开启。
 
-Worker 维护加密增量状态、每日 runner/token 上限和认证、DeepSeek、平台网络、SMTP 四类熔断。SMTP 失败只降级通知；认证熔断必须回到本地重新验证；达到预算后保留待处理队列，不伪造人民币费用。
+Worker 维护加密增量状态、每日 runner/token 上限，以及认证、DeepSeek 和平台网络熔断。认证熔断必须回到本地重新验证；达到预算后保留待处理队列，不伪造人民币费用。Worker 不发送邮件，也不接收邮箱账号或 SMTP 授权码。
 
 学习结果使用客户端长期 X25519 公钥加密；云端状态使用独立状态密钥。结果和状态 Artifact 使用不同保留策略，客户端导入后再执行有证据的清理。
 

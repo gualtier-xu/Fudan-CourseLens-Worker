@@ -6,8 +6,6 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
 from nacl.secret import SecretBox
 
 from courselens_worker.cloud_automation import (
@@ -17,7 +15,6 @@ from courselens_worker.cloud_automation import (
     _reset_daily_budget,
     _rules_need_ai,
     _seal_state,
-    _send_mail,
 )
 
 
@@ -44,33 +41,6 @@ class CloudAutomationTests(unittest.TestCase):
         self.assertEqual(value["runner_minutes"], 0)
         self.assertEqual(value["deepseek_tokens"], 0)
 
-    def test_disabled_email_does_not_open_network_connection(self):
-        with patch("smtplib.SMTP_SSL") as smtp:
-            result = _send_mail(
-                {"enabled": False}, "", "", "",
-                subject="test", code="ok", counts={}, elapsed=1, budget={},
-            )
-        self.assertTrue(result)
-        smtp.assert_not_called()
-
-    def test_email_includes_course_names_only_after_explicit_opt_in(self):
-        client = MagicMock()
-        context = MagicMock()
-        context.__enter__.return_value = client
-        with patch("smtplib.SMTP_SSL", return_value=context):
-            result = _send_mail(
-                {"enabled": True, "provider": "gmail", "include_course_names": True},
-                "sender@example.com", "app-password", "recipient@example.com",
-                subject="test", code="ok",
-                counts={"discovered": 1, "processed": 1, "failed": 0},
-                elapsed=1, budget={}, course_names=["课程 A\nInjected: no"],
-            )
-        self.assertTrue(result)
-        message = client.send_message.call_args.args[0]
-        body = message.get_content()
-        self.assertIn("courses=", body)
-        self.assertIn("课程 A Injected: no", body)
-
     def test_ai_key_is_required_only_for_rules_that_need_ai(self):
         self.assertFalse(_rules_need_ai({"rules": [{"discovery_only": True}]}))
         self.assertFalse(_rules_need_ai({
@@ -90,6 +60,17 @@ class CloudAutomationTests(unittest.TestCase):
         self.assertNotIn("pull_request:", text)
         self.assertIn("COURSELENS_CLOUD_ENABLED == 'true'", text)
         self.assertIn("actions: write", text)
+
+    def test_cloud_workflows_and_runtime_do_not_support_smtp(self):
+        root = Path(__file__).resolve().parents[1]
+        paths = [
+            root / "courselens_worker" / "cloud_automation.py",
+            root / ".github" / "workflows" / "cloud-daily.yml",
+            root / ".github" / "workflows" / "cloud-verify.yml",
+        ]
+        combined = "\n".join(path.read_text(encoding="utf-8").lower() for path in paths)
+        self.assertNotIn("smtp", combined)
+        self.assertNotIn("emailmessage", combined)
 
 
 if __name__ == "__main__":

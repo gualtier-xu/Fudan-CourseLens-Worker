@@ -37,9 +37,6 @@ jobs:
       COURSELENS_CLOUD_DEEPSEEK_API_KEY: ${{ secrets.COURSELENS_CLOUD_DEEPSEEK_API_KEY }}
       COURSELENS_CLOUD_RULES_JSON: ${{ secrets.COURSELENS_CLOUD_RULES_JSON }}
       COURSELENS_CLOUD_STATE_KEY: ${{ secrets.COURSELENS_CLOUD_STATE_KEY }}
-      COURSELENS_SMTP_USERNAME: ${{ secrets.COURSELENS_SMTP_USERNAME }}
-      COURSELENS_SMTP_APP_PASSWORD: ${{ secrets.COURSELENS_SMTP_APP_PASSWORD }}
-      COURSELENS_SMTP_RECIPIENT: ${{ secrets.COURSELENS_SMTP_RECIPIENT }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -48,7 +45,7 @@ jobs:
           cache: pip
       - name: Install pinned verification runtime
         run: python -m pip install --requirement requirements.txt
-      - name: Verify platform, AI and SMTP configuration
+      - name: Verify platform and AI configuration
         run: python -m courselens_worker.cloud_automation
       - name: Upload reset encrypted state
         if: inputs.reset_circuit == 'true' && hashFiles('.work/cloud-state/state.box.json') != ''

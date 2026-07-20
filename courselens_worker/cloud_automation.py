@@ -12,13 +12,10 @@ import io
 import json
 import os
 import secrets
-import smtplib
-import ssl
 import sys
 import time
 import zipfile
 from datetime import datetime
-from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -36,12 +33,6 @@ STATE_SCHEMA = "cloud.state.v1"
 RULES_SCHEMA = "cloud-automation.v1"
 RESULT_PREFIX = "courselens-cloud-result-"
 STATE_PREFIX = "courselens-cloud-state-"
-SMTP_PRESETS = {
-    "gmail": ("smtp.gmail.com", 465),
-    "qq": ("smtp.qq.com", 465),
-    "163": ("smtp.163.com", 465),
-    "outlook": ("smtp.office365.com", 587),
-}
 
 
 class CloudAutomationError(RuntimeError):
@@ -98,7 +89,6 @@ def _empty_state() -> dict[str, Any]:
             "authentication": {"state": "closed", "failures": 0},
             "deepseek": {"state": "closed", "failures": [], "retry_after": 0},
             "platform": {"state": "closed", "failures": 0},
-            "smtp": {"state": "closed", "failures": 0},
             "budget": {"state": "closed", "failures": 0},
         },
         "pending": [],
@@ -199,66 +189,6 @@ def _reset_daily_budget(state: dict[str, Any]) -> dict[str, Any]:
     return budget
 
 
-def _smtp_settings(rules: dict[str, Any]) -> tuple[dict[str, Any], str, str, str]:
-    notification = dict(rules.get("notification") or {})
-    username = os.environ.pop("COURSELENS_SMTP_USERNAME", "").strip()
-    password = os.environ.pop("COURSELENS_SMTP_APP_PASSWORD", "")
-    recipient = os.environ.pop("COURSELENS_SMTP_RECIPIENT", "").strip()
-    return notification, username, password, recipient
-
-
-def _send_mail(
-    notification: dict[str, Any], username: str, password: str, recipient: str,
-    *, subject: str, code: str, counts: dict[str, int], elapsed: float, budget: dict[str, Any],
-    course_names: list[str] | None = None,
-) -> bool:
-    if not notification.get("enabled"):
-        return True
-    provider = str(notification.get("provider") or "gmail")
-    if provider not in SMTP_PRESETS or not username or not password or not recipient:
-        return False
-    host, port = SMTP_PRESETS[provider]
-    message = EmailMessage()
-    message["From"] = username
-    message["To"] = recipient
-    message["Subject"] = subject
-    body = (
-        "CourseLens cloud automation report\n"
-        f"code={code}\n"
-        f"discovered={int(counts.get('discovered') or 0)}\n"
-        f"processed={int(counts.get('processed') or 0)}\n"
-        f"failed={int(counts.get('failed') or 0)}\n"
-        f"expiring_results={int(counts.get('expiring_results') or 0)}\n"
-        f"elapsed_seconds={round(elapsed, 1)}\n"
-        f"runner_minutes={round(float(budget.get('runner_minutes') or 0), 1)}\n"
-        f"deepseek_tokens={int(budget.get('deepseek_tokens') or 0)}\n"
-    )
-    if notification.get("include_course_names") and course_names:
-        safe_names = []
-        for value in course_names[:20]:
-            normalized = " ".join(str(value or "").split())[:120]
-            if normalized and normalized not in safe_names:
-                safe_names.append(normalized)
-        if safe_names:
-            body += "courses=\n" + "".join(f"- {name}\n" for name in safe_names)
-    message.set_content(body)
-    try:
-        if port == 465:
-            with smtplib.SMTP_SSL(host, port, timeout=30, context=ssl.create_default_context()) as client:
-                client.login(username, password)
-                client.send_message(message)
-        else:
-            with smtplib.SMTP(host, port, timeout=30) as client:
-                client.starttls(context=ssl.create_default_context())
-                client.login(username, password)
-                client.send_message(message)
-        return True
-    except (OSError, smtplib.SMTPException):
-        return False
-    finally:
-        password = ""
-
-
 def _verify_ai(api_key: str) -> None:
     if not api_key:
         return
@@ -310,7 +240,6 @@ def _expiring_result_count() -> int:
 def verify() -> int:
     started = time.monotonic()
     rules = _rules()
-    notification, smtp_user, smtp_password, smtp_recipient = _smtp_settings(rules)
     api_key = os.environ.pop("COURSELENS_CLOUD_DEEPSEEK_API_KEY", "").strip()
     connector = None
     try:
@@ -318,18 +247,10 @@ def verify() -> int:
         if _rules_need_ai(rules) and not api_key:
             raise CloudAutomationError("deepseek_key_missing")
         _verify_ai(api_key)
-        if not _send_mail(
-            notification, smtp_user, smtp_password, smtp_recipient,
-            subject="CourseLens cloud verification", code="cloud_verification_ok",
-            counts={"discovered": 0, "processed": 0, "failed": 0},
-            elapsed=time.monotonic() - started,
-            budget={"runner_minutes": 0, "deepseek_tokens": usage_snapshot().get("total_tokens", 0)},
-        ):
-            raise CloudAutomationError("smtp_verification_failed")
         if os.environ.get("COURSELENS_CLOUD_RESET_CIRCUIT") == "true":
             key = _state_key()
             state = _load_previous_state(key)
-            for name in ("authentication", "deepseek", "platform", "smtp", "budget"):
+            for name in ("authentication", "deepseek", "platform", "budget"):
                 state.setdefault("circuits", {})[name] = {
                     "state": "closed", "failures": [] if name == "deepseek" else 0,
                     "retry_after": 0, "last_error_code": "",
@@ -344,7 +265,6 @@ def verify() -> int:
         return 0
     finally:
         api_key = ""
-        smtp_password = ""
         if connector is not None:
             connector.session.close()
 
@@ -406,7 +326,6 @@ def run_daily() -> int:
     state = _load_previous_state(key)
     _prune_previous_states()
     rules = _rules()
-    notification, smtp_user, smtp_password, smtp_recipient = _smtp_settings(rules)
     api_key = os.environ.pop("COURSELENS_CLOUD_DEEPSEEK_API_KEY", "").strip()
     limits = dict(rules.get("budget") or {})
     budget = _reset_daily_budget(state)
@@ -415,7 +334,6 @@ def run_daily() -> int:
         "discovered": 0, "processed": 0, "failed": 0, "deferred": 0,
         "expiring_results": _expiring_result_count(),
     }
-    course_names: set[str] = set()
     code = "cloud_daily_completed"
     connector = None
     try:
@@ -443,9 +361,6 @@ def run_daily() -> int:
                 if not sub_id or sub_id in known or not lecture.get("has_playback"):
                     continue
                 counts["discovered"] += 1
-                title = " ".join(str(course.get("title") or "").split())
-                if title:
-                    course_names.add(title)
                 candidates.append((int(rule.get("priority") or 0), course, lecture, rule))
         candidates.sort(key=lambda item: (-item[0], str(item[2].get("date") or ""), str(item[2].get("sub_id") or "")))
         maximum = max(1, int(limits.get("max_lectures") or 2))
@@ -584,36 +499,10 @@ def run_daily() -> int:
             "last_run": {"code": code, "counts": counts, "elapsed_seconds": round(elapsed, 2)},
             "updated_at": time.time(),
         })
-        important = (
-            code != "cloud_daily_completed"
-            or counts["discovered"] > 0
-            or counts["processed"] > 0
-            or counts["expiring_results"] > 0
-        )
-        smtp_ok = True
-        if important:
-            smtp_ok = _send_mail(
-                notification, smtp_user, smtp_password, smtp_recipient,
-                subject="CourseLens cloud automation report", code=code,
-                counts=counts, elapsed=elapsed, budget=budget,
-                course_names=sorted(course_names),
-            )
-        if not smtp_ok:
-            circuits["smtp"] = {
-                "state": "degraded", "failures": int(dict(circuits.get("smtp") or {}).get("failures") or 0) + 1,
-                "last_error_code": "smtp_delivery_failed",
-            }
-            state["circuits"] = circuits
-        elif important and notification.get("enabled"):
-            circuits["smtp"] = {
-                "state": "closed", "failures": 0, "last_error_code": "",
-            }
-            state["circuits"] = circuits
         root = Path(".work") / "cloud-state"
         root.mkdir(parents=True, exist_ok=True)
         (root / "state.box.json").write_bytes(_seal_state(state, key))
         api_key = ""
-        smtp_password = ""
         if connector is not None:
             connector.session.close()
         print(
