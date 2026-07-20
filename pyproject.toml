@@ -20,4 +20,4 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["courselens_worker*"]
+include = ["courselens_worker*", "shared*"]

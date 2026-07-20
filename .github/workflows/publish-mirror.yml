@@ -1,0 +1,94 @@
+name: Publish generated Worker mirror PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Approved private monorepo commit
+        required: true
+        type: string
+      branch_name:
+        description: Generated public branch
+        required: true
+        default: codex/monorepo-worker-mirror
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-mirror-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: worker-mirror-release
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Create read-only private source token
+        id: source-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ vars.WORKER_MIRROR_SOURCE_APP_ID }}
+          private-key: ${{ secrets.WORKER_MIRROR_SOURCE_APP_PRIVATE_KEY }}
+          owner: gualtier-xu
+          repositories: Fudan-CourseLens-Private
+      - name: Check out the approved private source commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: gualtier-xu/Fudan-CourseLens-Private
+          ref: ${{ inputs.source_commit }}
+          token: ${{ steps.source-token.outputs.token }}
+          fetch-depth: 0
+          path: private-source
+          persist-credentials: false
+      - name: Confirm source commit belongs to private main
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          EXPECTED_SOURCE: ${{ inputs.source_commit }}
+        run: |
+          test "$(git -C private-source rev-parse HEAD)" = "${EXPECTED_SOURCE}"
+          gh auth setup-git
+          git -C private-source fetch origin main
+          git -C private-source merge-base --is-ancestor HEAD origin/main
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install minimal signing runtime
+        run: python -m pip install PyNaCl==1.6.2 zstandard==0.25.0
+      - name: Export signed deterministic snapshot
+        working-directory: private-source
+        env:
+          WORKER_MIRROR_SIGNING_KEY_ID: ${{ vars.WORKER_MIRROR_SIGNING_KEY_ID }}
+          WORKER_MIRROR_SIGNING_PRIVATE_KEY: ${{ secrets.WORKER_MIRROR_SIGNING_PRIVATE_KEY }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python scripts/export_worker_mirror.py --output "${RUNNER_TEMP}/worker-mirror"
+      - name: Create least-privilege public publisher token
+        id: publisher-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ vars.WORKER_MIRROR_PUBLISHER_APP_ID }}
+          private-key: ${{ secrets.WORKER_MIRROR_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: gualtier-xu
+          repositories: Fudan-CourseLens
+      - name: Publish generated branch and PR
+        working-directory: private-source
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          gh auth setup-git
+          python scripts/publish_worker_mirror.py \
+            --snapshot "${RUNNER_TEMP}/worker-mirror" \
+            --public-url https://github.com/gualtier-xu/Fudan-CourseLens.git \
+            --public-repository gualtier-xu/Fudan-CourseLens \
+            --branch "${BRANCH_NAME}" \
+            --source-commit "${SOURCE_COMMIT}" \
+            --pr-title "Generate public Worker mirror from private monorepo"
