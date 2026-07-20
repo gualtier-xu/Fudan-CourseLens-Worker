@@ -1,10 +1,5 @@
 # Fudan CourseLens Worker
 
-> This repository is a signed, CI-generated read-only mirror of the private
-> CourseLens monorepo. Do not edit generated files here; changes must originate
-> under `worker/` or `shared/protocol/` in `Fudan-CourseLens-Private` and arrive
-> through the protected mirror pull request workflow.
-
 > CourseLens 的公开 CPU 计算模板，也是个人 `Fudan-CourseLens-Worker` 的唯一受信文件来源。
 >
 > Public CPU worker template for CourseLens. A personal Worker is managed by the desktop client and must remain byte-for-byte aligned with this template.

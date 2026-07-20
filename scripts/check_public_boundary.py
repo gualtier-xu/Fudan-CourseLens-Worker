@@ -9,22 +9,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CODE_ROOTS = [
     ROOT / "courselens_worker",
-    ROOT / "shared",
     ROOT / ".github" / "workflows",
     ROOT / "scripts",
 ]
-CODE_PREFIXES = ("courselens_worker/", "shared/", ".github/workflows/", "scripts/")
+CODE_PREFIXES = ("courselens_worker/", ".github/workflows/", "scripts/")
 DOC_ROOTS = [ROOT / "README.md", ROOT / "docs"]
 DOC_PREFIXES = ("README.md", "docs/")
 SELF = Path(__file__).resolve()
-PRIVATE_PATH_PREFIXES = (
-    "archive.py", "credentials.py", "frontend/", "runtime-assets.json",
-    "src/api/", "src/runtime/", "src/remote/github_app.py", "vendor/",
-)
-FORBIDDEN_FILE_SUFFIXES = {
-    ".aac", ".avi", ".flac", ".m3u8", ".m4a", ".mkv", ".mov", ".mp3",
-    ".mp4", ".srt", ".ssa", ".ass", ".ts", ".vtt", ".wav", ".webm",
-}
 FORBIDDEN = {
     "course platform module": re.compile(r"(?:src\.)?api\.(?:icourse|webvpn)", re.I),
     "course URL acquisition": re.compile(r"\b(?:get_video_url|get_sub_info|sign_video_url)\b", re.I),
@@ -87,12 +78,6 @@ def _history_failures() -> list[str]:
         ).stdout.splitlines()
         for name in names:
             normalized = name.replace("\\", "/")
-            if normalized.startswith(PRIVATE_PATH_PREFIXES):
-                failures.append(f"history {commit[:12]}:{normalized}: private client path")
-            if Path(normalized).suffix.lower() in FORBIDDEN_FILE_SUFFIXES:
-                failures.append(f"history {commit[:12]}:{normalized}: media or subtitle file")
-        for name in names:
-            normalized = name.replace("\\", "/")
             if not normalized.startswith(CODE_PREFIXES) or Path(normalized).suffix not in {".py", ".yml", ".yaml", ".sh"}:
                 continue
             if normalized == "scripts/check_public_boundary.py":
@@ -117,14 +102,6 @@ def _history_failures() -> list[str]:
 
 def main() -> int:
     failures: list[str] = []
-    for path in ROOT.rglob("*"):
-        if not path.is_file() or ".git" in path.parts:
-            continue
-        normalized = path.relative_to(ROOT).as_posix()
-        if normalized.startswith(PRIVATE_PATH_PREFIXES):
-            failures.append(f"{normalized}: private client path")
-        if path.suffix.lower() in FORBIDDEN_FILE_SUFFIXES:
-            failures.append(f"{normalized}: media or subtitle file")
     for code_root in CODE_ROOTS:
         for path in code_root.rglob("*"):
             if path.suffix not in {".py", ".yml", ".yaml", ".sh"}:

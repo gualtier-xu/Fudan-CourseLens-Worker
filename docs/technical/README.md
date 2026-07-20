@@ -4,11 +4,6 @@
 >
 > Technical reference for maintainers and auditors. Managed personal Workers must be updated through the CourseLens client.
 
-> Source ownership: `Fudan-CourseLens-Private` is the sole source of truth. This
-> public repository and every managed personal Worker are generated artifacts.
-> The signed manifest, approved public commit/tree and client repair flow are
-> mandatory; direct maintenance is unsupported.
-
 ## 仓库角色与信任模型
 
 公开 `Fudan-CourseLens` 是唯一模板。私有客户端在 `runtime-assets.json` 中固定模板 commit 和 tree；个人 Worker 必须满足仓库归属、公开可见性、默认分支、受管描述和整棵 tree 一致性。任一条件漂移时，客户端禁止下发媒体授权和临时任务令牌。
