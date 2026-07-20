@@ -21,7 +21,7 @@
 
 ## 安全边界
 
-- 不包含复旦登录、WebVPN、课程发现、课程枚举、URL 签名或学生账号处理。
+- 平台登录、授权课程发现、媒体会话和凭据读取只允许出现在唯一受审计的 `courselens_worker/platform_session.py`；其他 Worker 文件和 workflow 不得实现平台连接逻辑。
 - 不提供原视频下载、断点续传、批量抓取、归档或公开媒体 API。
 - 媒体只以 HTTPS 流进入有界解码管道；源容器、PCM、Cookie、URL、字幕正文和 API Key 不写入磁盘、日志或 Artifact。
 - 重定向逐跳校验 HTTPS、公网 IP 和端口；跨域不转发 Cookie、Origin 或 Referer。
@@ -38,6 +38,17 @@
 - `standard`：SenseVoice 粗识别 → FireRedASR2 CTC → 用户授权的 DeepSeek 结合粗识别校对。
 - `summary`：可选 RapidOCR、时间戳摘要和章节。
 - `learning_pack + answer`：仅依据密封的最小证据回答，并原样保留受控 citation ID。
+
+### 云端无人值守入口
+
+- `cloud-verify.yml` 只验证平台登录、DeepSeek 和已启用的 SMTP，不生成课程资料。
+- `cloud-daily.yml` 固定列出 24 个半小时 cron，并通过 job-level 条件只在用户选中的北京时间分配 runner。
+- 新课程默认仅发现；每门课程的字幕、OCR、摘要和章节必须由用户显式开启。
+- 每日预算、认证/DeepSeek/网络/SMTP 熔断和待处理队列保存在加密状态 Artifact 中；状态保留 90 天且仅保留最新两份。
+- 学习结果使用客户端长期 X25519 公钥加密并由 Worker Ed25519 签名，随机命名 Artifact 保留 30 天。
+- SMTP 使用 Python 标准库和固定 Gmail、QQ、163、Outlook 预设，不调用第三方邮件 Action。
+
+云端 Secrets 由私有客户端写入个人 Worker 的 `courselens-worker` Environment。Secret 名称存在不表示内容已经通过验证，是否可启用由验证 workflow 和配置哈希共同决定。
 
 协议为 `job.v2` / `control.v2` / `result.v2`，兼容 v3 外层任务元数据：
 

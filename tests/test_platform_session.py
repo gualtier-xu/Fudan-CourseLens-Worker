@@ -33,6 +33,28 @@ class _FakeConnector:
 
 
 class PlatformSessionTests(unittest.TestCase):
+    def test_authorized_catalog_requires_successful_detail_for_each_course(self):
+        connector = object.__new__(PlatformSession)
+        connector._userinfo = None
+        calls = []
+
+        def course_json(path, *, params):
+            calls.append((path, dict(params)))
+            if path.endswith("get-course-list"):
+                if params["term"] == "24":
+                    return {"code": 0, "data": {"total": 2, "list": [
+                        {"id": "1", "title": "A", "term_name": "2026", "kkxy_name": "Dept"},
+                        {"id": "2", "title": "B", "term_name": "2026", "kkxy_name": "Dept"},
+                    ]}}
+                return {"code": 0, "data": {"total": 0, "list": []}}
+            if params["course_id"] == "2":
+                raise PlatformSessionError("platform_course_request_failed")
+            return {"code": 0, "data": {"title": "A", "realname": "Teacher", "sub_list": {}}}
+
+        connector._course_json = course_json
+        courses = connector.discover_authorized_courses()
+        self.assertEqual([item["course_id"] for item in courses], ["1"])
+        self.assertEqual(courses[0]["authorization_state"], "verified")
     def test_redirect_target_is_closed_to_expected_https_hosts(self):
         expected = "https://icourse.fudan.edu.cn/a"
         self.assertEqual(_validate_url(expected), expected)

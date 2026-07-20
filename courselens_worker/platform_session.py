@@ -1,9 +1,8 @@
-"""One-job platform session used only to authorize derived processing.
+"""Audited platform session used only to authorize derived processing.
 
-The connector deliberately exposes no course catalog, original-media download,
-resume, archive, or persistence API. Credentials arrive inside the existing
-sealed job, are used on the runner's own egress address, and are removed from
-the in-memory job before model work starts.
+This is the only public Worker module allowed to authenticate, discover the
+account's verified course catalog, or materialize short-lived media sources.
+It exposes no original-media download, resume, archive, or persistence API.
 """
 
 from __future__ import annotations
@@ -12,6 +11,8 @@ import base64
 import hashlib
 import html as html_module
 import json
+import math
+import os
 import re
 import time
 import uuid
@@ -368,6 +369,94 @@ class PlatformSession:
             self._userinfo = dict(data.get("params") or data.get("data") or {})
         return self._userinfo
 
+    @staticmethod
+    def _lecture_rows(course_data: dict[str, Any]) -> list[dict[str, Any]]:
+        lectures: list[dict[str, Any]] = []
+        for year, months in dict(course_data.get("sub_list") or {}).items():
+            for month, days in dict(months or {}).items():
+                for day, items in dict(days or {}).items():
+                    for item in list(items or []):
+                        if not isinstance(item, dict) or not item.get("id"):
+                            continue
+                        date = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+                        lectures.append({
+                            "sub_id": str(item["id"]),
+                            "sub_title": str(item.get("sub_title") or ""),
+                            "lecturer_name": str(item.get("lecturer_name") or ""),
+                            "date": date,
+                            "has_playback": str(item.get("playback_status") or "") == "1",
+                            "duration_seconds": max(0, int(item.get("duration") or item.get("duration_sec") or 0)),
+                        })
+        return lectures
+
+    def course_detail(self, course_id: str) -> dict[str, Any]:
+        data = self._course_json(
+            "/courseapi/v3/multi-search/get-course-detail",
+            params={"course_id": str(course_id)},
+        )
+        if data.get("code") not in (0, 200):
+            raise _fail("platform_course_request_failed")
+        raw = dict(data.get("data") or {})
+        return {
+            "course_id": str(course_id),
+            "title": str(raw.get("title") or ""),
+            "teacher": str(raw.get("realname") or raw.get("teacher") or ""),
+            "lectures": self._lecture_rows(raw),
+        }
+
+    def _course_catalog_page(self, term: str, page: int, per_page: int) -> dict[str, Any]:
+        data = self._course_json(
+            "/portal/courseapi/v3/multi-search/get-course-list",
+            params={
+                "tenant": TENANT_CODE, "term": str(term),
+                "page": max(1, int(page)), "per_page": max(1, min(500, int(per_page))),
+            },
+        )
+        if data.get("code") not in (0, 200):
+            raise _fail("platform_course_request_failed")
+        return dict(data.get("data") or {})
+
+    def discover_authorized_courses(self) -> list[dict[str, Any]]:
+        """Return only courses whose detail endpoint succeeds for this session."""
+        terms: list[tuple[str, str]] = []
+        for code in range(10, 36):
+            try:
+                data = self._course_catalog_page(str(code), 1, 1)
+            except PlatformSessionError:
+                continue
+            rows = list(data.get("list") or [])
+            if int(data.get("total") or 0) <= 0 or not rows:
+                continue
+            terms.append((str(code), str(rows[0].get("term_name") or code)))
+        output: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for term, term_name in sorted(terms, key=lambda item: int(item[0]), reverse=True):
+            first = self._course_catalog_page(term, 1, 500)
+            total = int(first.get("total") or 0)
+            pages = max(1, math.ceil(total / 500))
+            rows = list(first.get("list") or [])
+            for page in range(2, pages + 1):
+                rows.extend(list(self._course_catalog_page(term, page, 500).get("list") or []))
+            for raw in rows:
+                course_id = str(raw.get("id") or raw.get("course_id") or "").strip()
+                if not course_id or course_id in seen:
+                    continue
+                try:
+                    detail = self.course_detail(course_id)
+                except PlatformSessionError:
+                    continue
+                seen.add(course_id)
+                detail.update({
+                    "term": term_name,
+                    "department": str(
+                        raw.get("kkxy_name") or raw.get("school_name")
+                        or raw.get("dept_name") or raw.get("kkxy") or ""
+                    ),
+                    "authorization_state": "verified",
+                })
+                output.append(detail)
+        return output
+
     def _sign(self, media_url: str, now: int | None) -> str:
         info = self._userinfo_value()
         timestamp = int(now or time.time())
@@ -495,3 +584,28 @@ def materialize_job_sources(job: dict[str, Any]) -> dict[str, Any]:
     job["payload"] = payload
     job["secrets"] = secrets
     return job
+
+
+def cloud_session_from_environment() -> PlatformSession:
+    """Authenticate from Environment Secrets without exposing values to callers."""
+    account = os.environ.pop("COURSELENS_CLOUD_STUDENT_ID", "")
+    password = os.environ.pop("COURSELENS_CLOUD_PASSWORD", "")
+    if not account or not password:
+        account = ""
+        password = ""
+        raise _fail("platform_credentials_missing")
+    try:
+        for attempt in range(3):
+            connector = PlatformSession()
+            try:
+                connector.login(account, password)
+                return connector
+            except PlatformSessionError as exc:
+                connector.session.close()
+                if str(exc) != "platform_connection_failed" or attempt == 2:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
+    finally:
+        account = ""
+        password = ""
+    raise _fail("platform_connection_failed")

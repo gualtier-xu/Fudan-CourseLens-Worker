@@ -1,0 +1,145 @@
+name: Run unattended CourseLens daily automation
+run-name: CourseLens cloud daily ${{ github.run_id }}
+
+on:
+  schedule:
+    - cron: "30 0 * * *"
+    - cron: "30 1 * * *"
+    - cron: "30 2 * * *"
+    - cron: "30 3 * * *"
+    - cron: "30 4 * * *"
+    - cron: "30 5 * * *"
+    - cron: "30 6 * * *"
+    - cron: "30 7 * * *"
+    - cron: "30 8 * * *"
+    - cron: "30 9 * * *"
+    - cron: "30 10 * * *"
+    - cron: "30 11 * * *"
+    - cron: "30 12 * * *"
+    - cron: "30 13 * * *"
+    - cron: "30 14 * * *"
+    - cron: "30 15 * * *"
+    - cron: "30 16 * * *"
+    - cron: "30 17 * * *"
+    - cron: "30 18 * * *"
+    - cron: "30 19 * * *"
+    - cron: "30 20 * * *"
+    - cron: "30 21 * * *"
+    - cron: "30 22 * * *"
+    - cron: "30 23 * * *"
+  workflow_dispatch:
+    inputs:
+      trigger_kind:
+        description: Closed-set trigger kind
+        required: false
+        default: manual
+        type: choice
+        options: [manual, acceptance]
+      config_hash:
+        description: Opaque configuration digest
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: courselens-cloud-${{ github.repository_id }}
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (vars.COURSELENS_CLOUD_ENABLED == 'true' && (
+        (vars.COURSELENS_CLOUD_CRON == '08:30' && github.event.schedule == '30 0 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '09:30' && github.event.schedule == '30 1 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '10:30' && github.event.schedule == '30 2 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '11:30' && github.event.schedule == '30 3 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '12:30' && github.event.schedule == '30 4 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '13:30' && github.event.schedule == '30 5 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '14:30' && github.event.schedule == '30 6 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '15:30' && github.event.schedule == '30 7 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '16:30' && github.event.schedule == '30 8 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '17:30' && github.event.schedule == '30 9 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '18:30' && github.event.schedule == '30 10 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '19:30' && github.event.schedule == '30 11 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '20:30' && github.event.schedule == '30 12 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '21:30' && github.event.schedule == '30 13 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '22:30' && github.event.schedule == '30 14 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '23:30' && github.event.schedule == '30 15 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '00:30' && github.event.schedule == '30 16 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '01:30' && github.event.schedule == '30 17 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '02:30' && github.event.schedule == '30 18 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '03:30' && github.event.schedule == '30 19 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '04:30' && github.event.schedule == '30 20 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '05:30' && github.event.schedule == '30 21 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '06:30' && github.event.schedule == '30 22 * * *') ||
+        (vars.COURSELENS_CLOUD_CRON == '07:30' && github.event.schedule == '30 23 * * *')
+      ))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    environment: courselens-worker
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      COURSELENS_CLOUD_STUDENT_ID: ${{ secrets.COURSELENS_CLOUD_STUDENT_ID }}
+      COURSELENS_CLOUD_PASSWORD: ${{ secrets.COURSELENS_CLOUD_PASSWORD }}
+      COURSELENS_CLOUD_DEEPSEEK_API_KEY: ${{ secrets.COURSELENS_CLOUD_DEEPSEEK_API_KEY }}
+      COURSELENS_CLOUD_RULES_JSON: ${{ secrets.COURSELENS_CLOUD_RULES_JSON }}
+      COURSELENS_CLOUD_STATE_KEY: ${{ secrets.COURSELENS_CLOUD_STATE_KEY }}
+      COURSELENS_SMTP_USERNAME: ${{ secrets.COURSELENS_SMTP_USERNAME }}
+      COURSELENS_SMTP_APP_PASSWORD: ${{ secrets.COURSELENS_SMTP_APP_PASSWORD }}
+      COURSELENS_SMTP_RECIPIENT: ${{ secrets.COURSELENS_SMTP_RECIPIENT }}
+      COURSELENS_CLOUD_RESULT_PUBLIC_KEY: ${{ vars.COURSELENS_CLOUD_RESULT_PUBLIC_KEY }}
+      WORKER_SIGNING_PRIVATE_KEY: ${{ secrets.WORKER_SIGNING_PRIVATE_KEY }}
+      COURSELENS_MODEL_ROOT: ${{ github.workspace }}/.models
+      COURSELENS_STANDARD_STRATEGY: ${{ vars.COURSELENS_STANDARD_STRATEGY || 'sequential' }}
+      COURSELENS_OCR_CONCURRENCY: ${{ vars.COURSELENS_OCR_CONCURRENCY || '1' }}
+      COURSELENS_IMAGE_PREFETCH: ${{ vars.COURSELENS_IMAGE_PREFETCH || '16' }}
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.10"
+          cache: pip
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .models
+          key: asr-models-v1-sensevoice-7d1efa21-firered-1da8b737
+      - name: Install bounded media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes ffmpeg
+      - name: Install pinned runtime
+        run: python -m pip install --requirement requirements.txt
+      - name: Restore verified model cache
+        run: python scripts/install_models.py
+      - name: Run bounded cloud automation
+        run: python -m courselens_worker.cloud_automation
+      - name: Upload encrypted learning results
+        if: always() && hashFiles('.work/cloud-results/*.box.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: courselens-cloud-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .work/cloud-results/*.box.json
+          if-no-files-found: ignore
+          retention-days: 30
+          compression-level: 0
+      - name: Upload encrypted incremental state
+        if: always() && hashFiles('.work/cloud-state/state.box.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: courselens-cloud-state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .work/cloud-state/state.box.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+      - name: Remove transient data
+        if: always()
+        run: rm -rf .work

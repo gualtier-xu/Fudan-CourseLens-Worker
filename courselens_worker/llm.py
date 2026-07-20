@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
@@ -13,10 +14,23 @@ from .formats import normalize_segments
 
 API_URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-chat"
+_USAGE_LOCK = threading.RLock()
+_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 
 class LLMError(RuntimeError):
     pass
+
+
+def reset_usage() -> None:
+    with _USAGE_LOCK:
+        for key in _USAGE:
+            _USAGE[key] = 0
+
+
+def usage_snapshot() -> dict[str, int]:
+    with _USAGE_LOCK:
+        return dict(_USAGE)
 
 
 def _chat(api_key: str, messages: list[dict[str, str]], *, max_tokens: int = 8192) -> str:
@@ -40,7 +54,12 @@ def _chat(api_key: str, messages: list[dict[str, str]], *, max_tokens: int = 819
         last_status = response.status_code
         if response.status_code == 200:
             try:
-                return str(response.json()["choices"][0]["message"]["content"])
+                value = response.json()
+                usage = dict(value.get("usage") or {})
+                with _USAGE_LOCK:
+                    for key in _USAGE:
+                        _USAGE[key] += max(0, int(usage.get(key) or 0))
+                return str(value["choices"][0]["message"]["content"])
             except (ValueError, KeyError, IndexError, TypeError) as exc:
                 raise LLMError("AI response shape is invalid") from exc
         if response.status_code not in {408, 409, 429, 500, 502, 503, 504}:
