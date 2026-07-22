@@ -17,8 +17,7 @@ import sherpa_onnx
 from .formats import normalize_segments
 from .source import (
     MediaResponseProfile,
-    classify_media_response,
-    open_pinned_stream,
+    pinned_media_proxy,
 )
 
 SAMPLE_RATE = 16_000
@@ -86,8 +85,7 @@ def _drain_bounded(pipe, output: bytearray, *, limit: int = 16 * 1024) -> None:
             output.extend(block[:remaining])
 
 
-def _run_media_pipe(
-    source: dict[str, Any],
+def _run_bounded_process(
     command: list[str],
     *,
     timeout: int,
@@ -95,7 +93,7 @@ def _run_media_pipe(
 ) -> tuple[int, bytes, bytes]:
     process = subprocess.Popen(
         command,
-        stdin=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
@@ -120,32 +118,6 @@ def _run_media_pipe(
         reader.start()
     deadline = time.monotonic() + max(1, int(timeout))
     try:
-        with open_pinned_stream(source) as stream:
-            prefix = stream.response.read(64)
-            profile = classify_media_response(
-                int(stream.response.status),
-                stream.response.getheader("Content-Type", ""),
-                prefix,
-            )
-            error = _media_response_error(profile)
-            if error is not None:
-                raise error
-            if process.stdin is None:
-                raise ASRError("authorized media upstream connection failed")
-            try:
-                process.stdin.write(prefix)
-                while time.monotonic() < deadline:
-                    block = stream.response.read(64 * 1024)
-                    if not block:
-                        break
-                    process.stdin.write(block)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            finally:
-                try:
-                    process.stdin.close()
-                except (BrokenPipeError, OSError):
-                    pass
         remaining = max(1, int(deadline - time.monotonic()))
         process.wait(timeout=remaining)
     except Exception:
@@ -158,13 +130,28 @@ def _run_media_pipe(
     return int(process.returncode or 0), bytes(stdout), bytes(stderr)
 
 
+def _run_media_proxy(
+    source: dict[str, Any],
+    command: Callable[[str], list[str]],
+    *,
+    timeout: int,
+    capture_stdout: bool,
+) -> tuple[int, bytes, bytes]:
+    with pinned_media_proxy(source) as proxy:
+        return _run_bounded_process(
+            command(proxy.url),
+            timeout=timeout,
+            capture_stdout=capture_stdout,
+        )
+
+
 def _probe_duration(source: dict[str, Any]) -> float:
     try:
-        returncode, stdout, _ = _run_media_pipe(
+        returncode, stdout, _ = _run_media_proxy(
             source,
-            [
+            lambda media_url: [
                 "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                "-of", "default=nw=1:nk=1", "-i", "pipe:0",
+                "-of", "default=nw=1:nk=1", "-i", media_url,
             ],
             timeout=120,
             capture_stdout=True,
@@ -249,19 +236,30 @@ class RecognizerPool:
         return normalize_segments(segments)
 
 
-def _ffmpeg_pipe_command(target: Path, *, offset: float, duration: float) -> list[str]:
+def _ffmpeg_proxy_command(
+    target: Path,
+    media_url: str,
+    *,
+    offset: float,
+    duration: float,
+) -> list[str]:
     return [
-        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-        "-ss", f"{offset:.3f}", "-t", f"{duration:.3f}",
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{offset:.3f}", "-i", media_url, "-t", f"{duration:.3f}",
         "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-y", str(target),
     ]
 
 
 def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, duration: float) -> None:
     try:
-        returncode, _, ffmpeg_stderr = _run_media_pipe(
+        returncode, _, ffmpeg_stderr = _run_media_proxy(
             source,
-            _ffmpeg_pipe_command(target, offset=offset, duration=duration),
+            lambda media_url: _ffmpeg_proxy_command(
+                target,
+                media_url,
+                offset=offset,
+                duration=duration,
+            ),
             timeout=900,
             capture_stdout=False,
         )

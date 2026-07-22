@@ -43,14 +43,20 @@ class ASRDiagnosticsTests(unittest.TestCase):
                 self.assertIsNotNone(error)
                 self.assertEqual(safe_worker_error_detail(error), expected)
 
-    def test_slice_decode_discards_after_opening_the_single_input_stream(self):
+    def test_slice_decode_uses_loopback_range_input_and_fast_seek(self):
         with patch.dict(sys.modules, {"numpy": Mock(), "sherpa_onnx": Mock()}):
             from courselens_worker import asr
-        command = asr._ffmpeg_pipe_command(Path("slice.f32le"), offset=600, duration=300)
+        command = asr._ffmpeg_proxy_command(
+            Path("slice.f32le"),
+            "http://127.0.0.1:4321/random",
+            offset=600,
+            duration=300,
+        )
         input_index = command.index("-i")
         seek_index = command.index("-ss")
-        self.assertLess(input_index, seek_index)
-        self.assertEqual(command[input_index + 1], "pipe:0")
+        self.assertLess(seek_index, input_index)
+        self.assertEqual(command[input_index + 1], "http://127.0.0.1:4321/random")
+        self.assertNotIn("pipe:0", command)
 
 
 if __name__ == "__main__":
