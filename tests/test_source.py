@@ -212,7 +212,7 @@ class SourceSecurityTests(unittest.TestCase):
             self.assertNotIn("secret", proxy.failure_code)
 
     @patch("courselens_worker.source._request_once")
-    def test_loopback_proxy_refreshes_a_single_use_source_for_each_range(self, request):
+    def test_loopback_proxy_refreshes_once_for_each_ffmpeg_session(self, request):
         request.side_effect = lambda *_args, **_kwargs: (Mock(), FakeResponse(
             206,
             body=b"test",
@@ -237,8 +237,8 @@ class SourceSecurityTests(unittest.TestCase):
                 probe = urllib.request.Request(proxy.url, headers={"Range": "bytes=0-3"})
                 with urllib.request.urlopen(probe, timeout=5) as response:
                     self.assertEqual(response.read(), b"test")
-        self.assertEqual(len(calls), 3)
-        self.assertNotEqual(request.call_args_list[0].args[0], request.call_args_list[1].args[0])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(request.call_args_list[0].args[0], request.call_args_list[1].args[0])
 
     @patch("courselens_worker.source._connect_pinned_upstream")
     def test_connect_proxy_pins_target_and_tunnels_without_inspecting_bytes(self, connect):

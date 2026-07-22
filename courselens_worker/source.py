@@ -575,6 +575,16 @@ def pinned_media_proxy(source: dict[str, Any]) -> Iterator[PinnedMediaProxy]:
     public_ip_hint = str(source.get("resolved_public_ip") or "")
     refresh = source.get("_refresh_source")
     refresh_callback = refresh if callable(refresh) else None
+    if refresh_callback is not None:
+        # One FFmpeg invocation may request the MP4 index and media ranges
+        # several times. The CDN expects those requests to share one signed
+        # URL, while a later decode chunk needs a new URL. Each decode chunk
+        # creates a new proxy context, so refresh exactly once here rather than
+        # once per Range request.
+        refreshed = dict(refresh_callback() or {})
+        source_url = str(refreshed.get("url") or "")
+        headers = safe_headers(refreshed.get("headers"))
+        public_ip_hint = str(refreshed.get("resolved_public_ip") or "")
     # Never consume an authorized URL before FFmpeg makes its actual request.
     # DNS and public-address validation are sufficient here; every forwarded
     # request still uses hostname TLS/SNI and its independently pinned address.
@@ -584,7 +594,7 @@ def pinned_media_proxy(source: dict[str, Any]) -> Iterator[PinnedMediaProxy]:
         public_ip_hint=public_ip_hint,
     )
     path = f"/{secrets.token_urlsafe(24)}"
-    server = _PinnedRangeProxy(resolved, path, refresh_callback)
+    server = _PinnedRangeProxy(resolved, path)
     thread = threading.Thread(target=server.serve_forever, name="courselens-range-proxy", daemon=True)
     thread.start()
     try:
