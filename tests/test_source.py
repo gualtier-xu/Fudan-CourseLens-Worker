@@ -212,6 +212,63 @@ class SourceSecurityTests(unittest.TestCase):
             self.assertNotIn("secret", proxy.failure_code)
 
     @patch("courselens_worker.source._request_once")
+    def test_loopback_proxy_retries_one_authorization_failure_with_fresh_source(self, request):
+        request.side_effect = [
+            (Mock(), FakeResponse(403)),
+            (Mock(), FakeResponse(
+                206,
+                body=b"test",
+                headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Length": "4",
+                    "Content-Range": "bytes 0-3/8",
+                },
+            )),
+        ]
+        calls = []
+
+        def refresh():
+            calls.append(len(calls) + 1)
+            return {
+                "url": f"https://media.example.com/video?request={calls[-1]}",
+                "resolved_public_ip": "93.184.216.34",
+            }
+
+        source = {**refresh(), "_refresh_source": refresh}
+        with pinned_media_proxy(source) as proxy:
+            probe = urllib.request.Request(proxy.url, headers={"Range": "bytes=0-3"})
+            with urllib.request.urlopen(probe, timeout=5) as response:
+                self.assertEqual(response.read(), b"test")
+            self.assertEqual(proxy.failure_code, "")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(request.call_count, 2)
+        self.assertNotEqual(request.call_args_list[0].args[0], request.call_args_list[1].args[0])
+
+    @patch("courselens_worker.source._request_once")
+    def test_loopback_proxy_stops_after_one_failed_authorization_refresh(self, request):
+        request.side_effect = [
+            (Mock(), FakeResponse(403)),
+            (Mock(), FakeResponse(403)),
+        ]
+        calls = []
+
+        def refresh():
+            calls.append(len(calls) + 1)
+            return {
+                "url": f"https://media.example.com/video?request={calls[-1]}",
+                "resolved_public_ip": "93.184.216.34",
+            }
+
+        source = {**refresh(), "_refresh_source": refresh}
+        with pinned_media_proxy(source) as proxy:
+            probe = urllib.request.Request(proxy.url, headers={"Range": "bytes=0-3"})
+            with self.assertRaises(Exception):
+                urllib.request.urlopen(probe, timeout=5)
+            self.assertEqual(proxy.failure_code, "upstream_http_403")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(request.call_count, 2)
+
+    @patch("courselens_worker.source._request_once")
     def test_loopback_proxy_refreshes_once_for_each_ffmpeg_session(self, request):
         request.side_effect = lambda *_args, **_kwargs: (Mock(), FakeResponse(
             206,

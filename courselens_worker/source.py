@@ -337,19 +337,25 @@ class _PinnedRangeProxy(http.server.ThreadingHTTPServer):
     ):
         self.resolved = resolved
         self.refresh = refresh
+        self._refresh_lock = threading.Lock()
         self.media_path = path
         self.failure_code = ""
         super().__init__(("127.0.0.1", 0), _PinnedRangeHandler)
 
     def current_source(self) -> ResolvedSource:
+        return self.resolved
+
+    def refresh_source(self) -> ResolvedSource:
         if self.refresh is None:
             return self.resolved
-        value = dict(self.refresh() or {})
-        return resolve_source_address(
-            str(value.get("url") or ""),
-            safe_headers(value.get("headers")),
-            public_ip_hint=str(value.get("resolved_public_ip") or ""),
-        )
+        with self._refresh_lock:
+            value = dict(self.refresh() or {})
+            self.resolved = resolve_source_address(
+                str(value.get("url") or ""),
+                safe_headers(value.get("headers")),
+                public_ip_hint=str(value.get("resolved_public_ip") or ""),
+            )
+            return self.resolved
 
 
 @dataclass(frozen=True)
@@ -509,16 +515,29 @@ class _PinnedRangeHandler(http.server.BaseHTTPRequestHandler):
         connection = response = None
         try:
             resolved = self.server.current_source()
-            headers = dict(resolved.headers)
-            if range_header:
-                headers["Range"] = range_header
-            connection, response = _request_once(
-                resolved.url,
-                headers,
-                resolved.ip,
-                timeout=60,
-                probe=False,
-            )
+            def request(current: ResolvedSource):
+                headers = dict(current.headers)
+                if range_header:
+                    headers["Range"] = range_header
+                return _request_once(
+                    current.url,
+                    headers,
+                    current.ip,
+                    timeout=60,
+                    probe=False,
+                )
+
+            connection, response = request(resolved)
+            if response.status in {401, 403} and self.server.refresh is not None:
+                # A short-lived CDN authorization can expire between decode
+                # sessions. Refresh and retry this exact Range once. Persistent
+                # authorization failures remain fail-closed and are reduced to
+                # the same fixed public error code below.
+                response.close()
+                connection.close()
+                response = connection = None
+                resolved = self.server.refresh_source()
+                connection, response = request(resolved)
             status = int(response.status)
             if status not in {200, 206, 416}:
                 if status in {301, 302, 303, 307, 308}:
@@ -594,7 +613,7 @@ def pinned_media_proxy(source: dict[str, Any]) -> Iterator[PinnedMediaProxy]:
         public_ip_hint=public_ip_hint,
     )
     path = f"/{secrets.token_urlsafe(24)}"
-    server = _PinnedRangeProxy(resolved, path)
+    server = _PinnedRangeProxy(resolved, path, refresh_callback)
     thread = threading.Thread(target=server.serve_forever, name="courselens-range-proxy", daemon=True)
     thread.start()
     try:
