@@ -152,6 +152,23 @@ class PlatformSessionTests(unittest.TestCase):
         self.assertEqual(connector._sign.call_count, 2)
         self.assertIn("second", refreshed["url"])
 
+    def test_media_source_uses_strictly_increasing_signing_seconds(self):
+        connector = self._media_connector()
+        connector._sign = Mock(side_effect=lambda value, now: f"{value}?t={now}")
+        with (
+            patch("courselens_worker.platform_session.time.time", side_effect=[100, 100, 100, 101]),
+            patch("courselens_worker.platform_session.time.sleep") as sleep,
+            patch(
+                "courselens_worker.source.resolve_source_address",
+                side_effect=lambda url, headers: ResolvedSource(url, headers, "93.184.216.34"),
+            ),
+        ):
+            source = connector.media_source("1", "2")
+            source["_refresh_source"]()
+        signed_seconds = [item.args[1] for item in connector._sign.call_args_list]
+        self.assertEqual(signed_seconds, sorted(set(signed_seconds)))
+        sleep.assert_called_once_with(1)
+
     def test_connection_failure_retries_without_retrying_authentication_errors(self):
         class FlakyConnector(_FakeConnector):
             attempts = 0

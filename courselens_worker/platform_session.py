@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 import uuid
 from binascii import hexlify
@@ -506,9 +507,23 @@ class PlatformSession:
             for name, value in self._source_headers().items()
             if name.casefold() not in {"cookie", "origin", "referer"}
         }
+        sign_lock = threading.Lock()
+        last_signed_at = 0
 
         def refresh_source() -> dict[str, Any]:
-            signed = self._sign(base, int(time.time()) + clock_offset)
+            nonlocal last_signed_at
+            # The CDN rejects a repeated byte range when two otherwise fresh
+            # URLs carry the same second-granularity signing timestamp. FFmpeg
+            # legitimately repeats MP4 index ranges, so serialize issuance and
+            # wait for the next real server-aligned second instead of inventing
+            # a future timestamp or retrying a rejected URL.
+            with sign_lock:
+                signed_at = int(time.time()) + clock_offset
+                while signed_at <= last_signed_at:
+                    time.sleep(max(0.01, min(1.0, last_signed_at + 1 - signed_at)))
+                    signed_at = int(time.time()) + clock_offset
+                last_signed_at = signed_at
+                signed = self._sign(base, last_signed_at)
             resolved = resolve_source_address(signed, direct_headers)
             return {
                 "url": resolved.url,
