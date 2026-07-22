@@ -13,6 +13,7 @@ from courselens_worker.source import (
     pinned_connect_proxy,
     pinned_media_proxy,
     resolve_source,
+    resolve_source_address,
     safe_headers,
     safe_source_error_code,
     validate_https_url,
@@ -74,6 +75,14 @@ class SourceSecurityTests(unittest.TestCase):
     def test_public_https_is_accepted(self, resolve):
         resolve.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
         self.assertEqual(validate_https_url("https://example.com/media"), "https://example.com/media")
+
+    @patch("courselens_worker.source._request_once")
+    @patch("courselens_worker.source.socket.getaddrinfo")
+    def test_address_resolution_does_not_consume_the_source(self, resolve, request):
+        resolve.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+        value = resolve_source_address("https://example.com/media", {"User-Agent": "CourseLens"})
+        self.assertEqual(value.ip, "93.184.216.34")
+        request.assert_not_called()
 
     @patch("courselens_worker.source._request_once")
     @patch("courselens_worker.source.socket.getaddrinfo")
@@ -162,7 +171,7 @@ class SourceSecurityTests(unittest.TestCase):
 
     @patch("courselens_worker.source._request_once")
     def test_loopback_proxy_forwards_one_bounded_range_without_disk(self, request):
-        request.return_value = (Mock(), FakeResponse(
+        request.side_effect = lambda *_args, **_kwargs: (Mock(), FakeResponse(
             206,
             body=b"test",
             headers={
@@ -201,6 +210,35 @@ class SourceSecurityTests(unittest.TestCase):
                 urllib.request.urlopen(probe, timeout=5)
             self.assertEqual(proxy.failure_code, "upstream_http_403")
             self.assertNotIn("secret", proxy.failure_code)
+
+    @patch("courselens_worker.source._request_once")
+    def test_loopback_proxy_refreshes_a_single_use_source_for_each_range(self, request):
+        request.side_effect = lambda *_args, **_kwargs: (Mock(), FakeResponse(
+            206,
+            body=b"test",
+            headers={
+                "Content-Type": "video/mp4",
+                "Content-Length": "4",
+                "Content-Range": "bytes 0-3/8",
+            },
+        ))
+        calls = []
+
+        def refresh():
+            calls.append(len(calls) + 1)
+            return {
+                "url": f"https://media.example.com/video?request={calls[-1]}",
+                "resolved_public_ip": "93.184.216.34",
+            }
+
+        source = {**refresh(), "_refresh_source": refresh}
+        with pinned_media_proxy(source) as proxy:
+            for _ in range(2):
+                probe = urllib.request.Request(proxy.url, headers={"Range": "bytes=0-3"})
+                with urllib.request.urlopen(probe, timeout=5) as response:
+                    self.assertEqual(response.read(), b"test")
+        self.assertEqual(len(calls), 3)
+        self.assertNotEqual(request.call_args_list[0].args[0], request.call_args_list[1].args[0])
 
     @patch("courselens_worker.source._connect_pinned_upstream")
     def test_connect_proxy_pins_target_and_tunnels_without_inspecting_bytes(self, connect):

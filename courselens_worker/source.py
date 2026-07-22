@@ -14,7 +14,7 @@ import socketserver
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import urljoin, urlsplit
 
 
@@ -136,6 +136,17 @@ def _validate_and_resolve(url: str, public_ip_hint: str = "") -> tuple[str, str]
 
 def validate_https_url(url: str) -> str:
     return _validate_and_resolve(url)[0]
+
+
+def resolve_source_address(
+    url: str,
+    headers: dict[str, str],
+    *,
+    public_ip_hint: str = "",
+) -> ResolvedSource:
+    """Validate and pin a source without consuming a short-lived request URL."""
+    resolved_url, ip = _validate_and_resolve(url, public_ip_hint)
+    return ResolvedSource(resolved_url, safe_headers(headers), ip)
 
 
 def _request_once(
@@ -318,11 +329,27 @@ def pinned_curl_command(source: dict[str, Any]) -> list[str]:
 class _PinnedRangeProxy(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, resolved: ResolvedSource, path: str):
+    def __init__(
+        self,
+        resolved: ResolvedSource,
+        path: str,
+        refresh: Callable[[], dict[str, Any]] | None = None,
+    ):
         self.resolved = resolved
+        self.refresh = refresh
         self.media_path = path
         self.failure_code = ""
         super().__init__(("127.0.0.1", 0), _PinnedRangeHandler)
+
+    def current_source(self) -> ResolvedSource:
+        if self.refresh is None:
+            return self.resolved
+        value = dict(self.refresh() or {})
+        return resolve_source_address(
+            str(value.get("url") or ""),
+            safe_headers(value.get("headers")),
+            public_ip_hint=str(value.get("resolved_public_ip") or ""),
+        )
 
 
 @dataclass(frozen=True)
@@ -479,12 +506,12 @@ class _PinnedRangeHandler(http.server.BaseHTTPRequestHandler):
             self.server.failure_code = "invalid_range"
             self.send_error(416)
             return
-        resolved = self.server.resolved
-        headers = dict(resolved.headers)
-        if range_header:
-            headers["Range"] = range_header
         connection = response = None
         try:
+            resolved = self.server.current_source()
+            headers = dict(resolved.headers)
+            if range_header:
+                headers["Range"] = range_header
             connection, response = _request_once(
                 resolved.url,
                 headers,
@@ -546,17 +573,18 @@ def pinned_media_proxy(source: dict[str, Any]) -> Iterator[PinnedMediaProxy]:
     headers = safe_headers(source.get("headers"))
     source_url = str(source.get("url") or "")
     public_ip_hint = str(source.get("resolved_public_ip") or "")
-    if public_ip_hint:
-        # A short-lived source may permit only one authorization request.
-        # The IP hint is still independently checked as globally routable and
-        # the actual request still performs hostname TLS/SNI validation, so an
-        # extra network probe is unnecessary and can consume that request.
-        validated_url, validated_ip = _validate_and_resolve(source_url, public_ip_hint)
-        resolved = ResolvedSource(validated_url, headers, validated_ip)
-    else:
-        resolved = resolve_source(source_url, headers)
+    refresh = source.get("_refresh_source")
+    refresh_callback = refresh if callable(refresh) else None
+    # Never consume an authorized URL before FFmpeg makes its actual request.
+    # DNS and public-address validation are sufficient here; every forwarded
+    # request still uses hostname TLS/SNI and its independently pinned address.
+    resolved = resolve_source_address(
+        source_url,
+        headers,
+        public_ip_hint=public_ip_hint,
+    )
     path = f"/{secrets.token_urlsafe(24)}"
-    server = _PinnedRangeProxy(resolved, path)
+    server = _PinnedRangeProxy(resolved, path, refresh_callback)
     thread = threading.Thread(target=server.serve_forever, name="courselens-range-proxy", daemon=True)
     thread.start()
     try:

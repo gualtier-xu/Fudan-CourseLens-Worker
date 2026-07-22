@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import urlsplit
 
 from courselens_worker.platform_session import (
@@ -112,17 +112,18 @@ class PlatformSessionTests(unittest.TestCase):
             {"User-Agent": "CourseLens", "Accept": "*/*"},
             "93.184.216.34",
         )
-        with patch("courselens_worker.source.resolve_source", return_value=resolved) as probe:
+        with patch("courselens_worker.source.resolve_source_address", return_value=resolved) as resolve:
             source = connector.media_source("1", "2")
         self.assertEqual(source["url"], resolved.url)
         self.assertEqual(source["resolved_public_ip"], "93.184.216.34")
         self.assertNotIn("Cookie", source["headers"])
-        self.assertNotIn("Cookie", probe.call_args.args[1])
+        self.assertNotIn("Cookie", resolve.call_args.args[1])
+        self.assertTrue(callable(source["_refresh_source"]))
 
     def test_media_source_falls_back_to_runner_webvpn_session(self):
         connector = self._media_connector()
         with patch(
-            "courselens_worker.source.resolve_source",
+            "courselens_worker.source.resolve_source_address",
             side_effect=SourceSecurityError("source request failed: OSError"),
         ):
             source = connector.media_source("1", "2")
@@ -130,6 +131,26 @@ class PlatformSessionTests(unittest.TestCase):
         self.assertEqual(parsed.hostname, "webvpn.fudan.edu.cn")
         self.assertIn("clientUUID=test", parsed.query)
         self.assertEqual(source["headers"]["Cookie"], "sealed")
+
+    def test_media_source_refreshes_the_signed_url_for_each_proxy_request(self):
+        connector = self._media_connector()
+        resolved = ResolvedSource(
+            "https://media.example.edu/lecture.mp4?clientUUID=first&t=first",
+            {"User-Agent": "CourseLens"},
+            "93.184.216.34",
+        )
+        connector._sign = Mock(side_effect=[
+            resolved.url,
+            "https://media.example.edu/lecture.mp4?clientUUID=second&t=second",
+        ])
+        with patch(
+            "courselens_worker.source.resolve_source_address",
+            side_effect=lambda url, headers: ResolvedSource(url, headers, "93.184.216.34"),
+        ):
+            source = connector.media_source("1", "2")
+            refreshed = source["_refresh_source"]()
+        self.assertEqual(connector._sign.call_count, 2)
+        self.assertIn("second", refreshed["url"])
 
     def test_connection_failure_retries_without_retrying_authentication_errors(self):
         class FlakyConnector(_FakeConnector):

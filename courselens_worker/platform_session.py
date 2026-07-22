@@ -494,28 +494,34 @@ class PlatformSession:
             base = str((((detail.get("data") or {}).get("content") or {}).get("playback") or {}).get("url") or "")
         if not base or not urlparse(base).path.lower().endswith(".mp4"):
             raise _fail("platform_media_missing")
-        signed = self._sign(base, int(info.get("now") or 0) or None)
-        # The signature is minted on this runner and the direct CDN route is
-        # preferred when a bounded SSRF-safe Range probe succeeds.  Do not send
-        # WebVPN cookies to the CDN.  Some campus/CDN names are unavailable to
-        # hosted runners, so retain the authenticated WebVPN route as a
-        # fail-closed fallback rather than guessing from DNS alone.
-        from .source import SourceSecurityError, resolve_source
+        server_now = int(info.get("now") or 0)
+        clock_offset = server_now - int(time.time()) if server_now else 0
+        # A signed CDN URL may authorize only one media request. The desktop
+        # client already obtains a new URL per browser Range; expose the same
+        # behavior to the runner's in-memory proxy without retaining cookies.
+        from .source import SourceSecurityError, resolve_source_address
 
         direct_headers = {
             name: value
             for name, value in self._source_headers().items()
             if name.casefold() not in {"cookie", "origin", "referer"}
         }
+
+        def refresh_source() -> dict[str, Any]:
+            signed = self._sign(base, int(time.time()) + clock_offset)
+            resolved = resolve_source_address(signed, direct_headers)
+            return {
+                "url": resolved.url,
+                "headers": resolved.headers,
+                "resolved_public_ip": resolved.ip,
+            }
+
         try:
-            resolved = resolve_source(signed, direct_headers)
+            source = refresh_source()
         except SourceSecurityError:
+            signed = self._sign(base, int(time.time()) + clock_offset)
             return {"url": _vpn_url(signed), "headers": self._source_headers()}
-        return {
-            "url": resolved.url,
-            "headers": resolved.headers,
-            "resolved_public_ip": resolved.ip,
-        }
+        return {**source, "_refresh_source": refresh_source}
 
     def slide_sources(self, course_id: str, sub_id: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
