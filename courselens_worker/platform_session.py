@@ -495,11 +495,27 @@ class PlatformSession:
         if not base or not urlparse(base).path.lower().endswith(".mp4"):
             raise _fail("platform_media_missing")
         signed = self._sign(base, int(info.get("now") or 0) or None)
-        # Keep authorization and the media stream on the same runner-side
-        # WebVPN session.  The upstream CDN name is not guaranteed to resolve
-        # from GitHub-hosted runners, and a direct request would also bypass
-        # the session whose egress address was used to mint the signature.
-        return {"url": _vpn_url(signed), "headers": self._source_headers()}
+        # The signature is minted on this runner and the direct CDN route is
+        # preferred when a bounded SSRF-safe Range probe succeeds.  Do not send
+        # WebVPN cookies to the CDN.  Some campus/CDN names are unavailable to
+        # hosted runners, so retain the authenticated WebVPN route as a
+        # fail-closed fallback rather than guessing from DNS alone.
+        from .source import SourceSecurityError, resolve_source
+
+        direct_headers = {
+            name: value
+            for name, value in self._source_headers().items()
+            if name.casefold() not in {"cookie", "origin", "referer"}
+        }
+        try:
+            resolved = resolve_source(signed, direct_headers)
+        except SourceSecurityError:
+            return {"url": _vpn_url(signed), "headers": self._source_headers()}
+        return {
+            "url": resolved.url,
+            "headers": resolved.headers,
+            "resolved_public_ip": resolved.ip,
+        }
 
     def slide_sources(self, course_id: str, sub_id: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []

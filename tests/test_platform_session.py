@@ -10,6 +10,7 @@ from courselens_worker.platform_session import (
     _validate_url,
     materialize_job_sources,
 )
+from courselens_worker.source import ResolvedSource, SourceSecurityError
 
 
 class _FakeConnector:
@@ -88,7 +89,7 @@ class PlatformSessionTests(unittest.TestCase):
         self.assertEqual(result["payload"]["media"]["start_seconds"], 600)
         self.assertEqual(len(result["payload"]["slides"]), 1)
 
-    def test_media_source_stays_inside_runner_webvpn_session(self):
+    def _media_connector(self):
         connector = object.__new__(PlatformSession)
         connector._course_json = lambda *_args, **_kwargs: {
             "data": {
@@ -99,11 +100,36 @@ class PlatformSessionTests(unittest.TestCase):
             }
         }
         connector._sign = lambda value, _now: value + "?clientUUID=test&t=test"
-        connector._source_headers = lambda: {"Cookie": "sealed"}
-        source = connector.media_source("1", "2")
+        connector._source_headers = lambda: {
+            "Cookie": "sealed", "User-Agent": "CourseLens", "Accept": "*/*"
+        }
+        return connector
+
+    def test_media_source_prefers_verified_direct_route_without_cookie(self):
+        connector = self._media_connector()
+        resolved = ResolvedSource(
+            "https://media.example.edu/lecture.mp4?clientUUID=test&t=test",
+            {"User-Agent": "CourseLens", "Accept": "*/*"},
+            "93.184.216.34",
+        )
+        with patch("courselens_worker.source.resolve_source", return_value=resolved) as probe:
+            source = connector.media_source("1", "2")
+        self.assertEqual(source["url"], resolved.url)
+        self.assertEqual(source["resolved_public_ip"], "93.184.216.34")
+        self.assertNotIn("Cookie", source["headers"])
+        self.assertNotIn("Cookie", probe.call_args.args[1])
+
+    def test_media_source_falls_back_to_runner_webvpn_session(self):
+        connector = self._media_connector()
+        with patch(
+            "courselens_worker.source.resolve_source",
+            side_effect=SourceSecurityError("source request failed: OSError"),
+        ):
+            source = connector.media_source("1", "2")
         parsed = urlsplit(source["url"])
         self.assertEqual(parsed.hostname, "webvpn.fudan.edu.cn")
         self.assertIn("clientUUID=test", parsed.query)
+        self.assertEqual(source["headers"]["Cookie"], "sealed")
 
     def test_connection_failure_retries_without_retrying_authentication_errors(self):
         class FlakyConnector(_FakeConnector):
