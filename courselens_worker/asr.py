@@ -250,15 +250,17 @@ def _ffmpeg_proxy_command(
     ]
 
 
-def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, duration: float) -> None:
+def _decode_chunk_from_url(
+    media_url: str,
+    target: Path,
+    *,
+    offset: float,
+    duration: float,
+) -> None:
     try:
-        returncode, _, ffmpeg_stderr = _run_media_proxy(
-            source,
-            lambda media_url: _ffmpeg_proxy_command(
-                target,
-                media_url,
-                offset=offset,
-                duration=duration,
+        returncode, _, ffmpeg_stderr = _run_bounded_process(
+            _ffmpeg_proxy_command(
+                target, media_url, offset=offset, duration=duration,
             ),
             timeout=900,
             capture_stdout=False,
@@ -272,6 +274,12 @@ def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, durati
     if returncode != 0 or not target.is_file() or target.stat().st_size == 0:
         target.unlink(missing_ok=True)
         raise _decode_failure(ffmpeg_stderr.decode("utf-8", errors="replace"))
+
+
+def _decode_chunk(source: dict[str, Any], target: Path, *, offset: float, duration: float) -> None:
+    """Decode one bounded chunk through a transient pinned media session."""
+    with pinned_media_proxy(source) as proxy:
+        _decode_chunk_from_url(proxy.url, target, offset=offset, duration=duration)
 
 
 def transcribe(
@@ -312,14 +320,24 @@ def transcribe(
     total_chunks = max(1, int((duration + PCM_CHUNK_SECONDS - 1) // PCM_CHUNK_SECONDS))
     completed_chunks = max(0, min(total_chunks, int(prior.get("completed_chunks") or 0)))
     started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="courselens-pcm-") as temporary:
+    # Keep one authorized CDN playback session for the complete task.  The
+    # runner still launches one bounded FFmpeg process and retains only one
+    # transient PCM file per chunk.  The loopback proxy refreshes its upstream
+    # authorization once on a real 401/403, so a long lecture can recover from
+    # expiry without creating a new CDN playback identity every ten minutes.
+    with tempfile.TemporaryDirectory(prefix="courselens-pcm-") as temporary, pinned_media_proxy(source) as proxy:
         root = Path(temporary)
         for index in range(completed_chunks, total_chunks):
             relative_offset = index * PCM_CHUNK_SECONDS
             absolute_offset = start_seconds + relative_offset
             chunk_duration = min(PCM_CHUNK_SECONDS, duration - relative_offset)
             pcm = root / f"chunk-{index:04d}.f32le"
-            _decode_chunk(source, pcm, offset=absolute_offset, duration=chunk_duration)
+            _decode_chunk_from_url(
+                proxy.url,
+                pcm,
+                offset=absolute_offset,
+                duration=chunk_duration,
+            )
             if mode == "standard" and strategy == "parallel":
                 with ThreadPoolExecutor(max_workers=2, thread_name_prefix="asr") as executor:
                     sense_future = executor.submit(
