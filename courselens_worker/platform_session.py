@@ -768,11 +768,12 @@ class PlatformSession:
             if name.casefold() not in {"cookie", "origin", "referer"}
         }
         sign_lock = threading.Lock()
+        clock_offset: int | None = None
         last_signed_at = 0
         latest_signed_url = ""
 
         def refresh_source() -> dict[str, Any]:
-            nonlocal last_signed_at, latest_signed_url
+            nonlocal clock_offset, last_signed_at, latest_signed_url
             # The CDN rejects a repeated byte range when two otherwise fresh
             # URLs carry the same second-granularity signing timestamp. FFmpeg
             # legitimately repeats MP4 index ranges, so serialize issuance and
@@ -780,7 +781,13 @@ class PlatformSession:
             # a future timestamp or retrying a rejected URL.
             with sign_lock:
                 base, server_now = self._media_base(course_id, sub_id)
-                clock_offset = server_now - int(time.time()) if server_now else 0
+                # Some platform responses are cached together with their
+                # `now` field. Recalibrating from that stale value would move
+                # later CDN signatures backwards, even though the refreshed
+                # base capability is valid. Calibrate once per task session
+                # and advance from the local clock afterwards.
+                if clock_offset is None:
+                    clock_offset = server_now - int(time.time()) if server_now else 0
                 signed_at = int(time.time()) + clock_offset
                 while signed_at <= last_signed_at:
                     time.sleep(max(0.01, min(1.0, last_signed_at + 1 - signed_at)))

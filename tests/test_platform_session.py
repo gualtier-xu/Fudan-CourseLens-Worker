@@ -316,13 +316,39 @@ class PlatformSessionTests(unittest.TestCase):
         self.assertIn("base=second", connector._sign.call_args_list[1].args[0])
         self.assertIn("base=second", refreshed["url"])
 
+    def test_media_refresh_keeps_initial_clock_offset_when_platform_now_is_stale(self):
+        connector = self._media_connector()
+        connector._course_json = Mock(side_effect=[
+            {"data": {"now": 100, "video_list": {"main": {
+                "preview_url": "https://media.example.edu/lecture.mp4?base=first"
+            }}}},
+            {"data": {"now": 100, "video_list": {"main": {
+                "preview_url": "https://media.example.edu/lecture.mp4?base=second"
+            }}}},
+        ])
+        connector._sign = Mock(side_effect=lambda value, now: f"{value}&t={now}")
+        with (
+            patch("courselens_worker.platform_session.time.time", side_effect=[100, 100, 165]),
+            patch(
+                "courselens_worker.source.resolve_source_address",
+                side_effect=lambda url, headers: ResolvedSource(
+                    url, headers, "93.184.216.34"
+                ),
+            ),
+        ):
+            source = connector.media_source("1", "2")
+            source["_refresh_source"]()
+
+        signed_seconds = [item.args[1] for item in connector._sign.call_args_list]
+        self.assertEqual(signed_seconds, [100, 165])
+
     def test_media_source_uses_strictly_increasing_signing_seconds(self):
         connector = self._media_connector()
         connector._sign = Mock(side_effect=lambda value, now: f"{value}?t={now}")
         with (
             patch(
                 "courselens_worker.platform_session.time.time",
-                side_effect=[100, 100, 100, 100, 101],
+                side_effect=[100, 100, 100, 101],
             ),
             patch("courselens_worker.platform_session.time.sleep") as sleep,
             patch(

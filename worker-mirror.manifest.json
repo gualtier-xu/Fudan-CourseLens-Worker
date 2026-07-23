@@ -134,8 +134,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/platform_session.py",
-        "sha256": "1cfc3317ab95efd920f27983748a0cc440f9413ad7ded53ca18f387ddcfad768",
-        "size": 38797
+        "sha256": "311ea644cc13e19cfbe632c7ca1a01f21db1a644fa85696df19ad760d9be1744",
+        "size": 39262
       },
       {
         "mode": "100644",
@@ -266,8 +266,8 @@
       {
         "mode": "100644",
         "path": "tests/test_platform_session.py",
-        "sha256": "ab3772902618af3aebb621997b17216939fc9aec1842662a2a82a68367fa0926",
-        "size": 18339
+        "sha256": "5eda8b1124f20dc5f2024a17b8a0427d3bba09893f1cb65a9c8d5ffd3c079f3b",
+        "size": 19519
       },
       {
         "mode": "100644",
@@ -300,8 +300,8 @@
         "size": 2967
       }
     ],
-    "git_tree": "2151a7eaeb4b82f7e2342a0706747582ba138379",
-    "tree_sha256": "8deb368d5c22fba3fbdef11acac6ce0bba468058fd60602432f64193c66dfe71"
+    "git_tree": "0008bbf0a5ffd22fd7e7be05f4385543812ae6d7",
+    "tree_sha256": "781a7cd6c4388451176355287c467672b36921bd26770f6825cf68c6b8b531b1"
   },
   "protocol": {
     "supported_versions": [
@@ -310,8 +310,8 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "801178c2fe43067e7110e566898a0e6eaaec8b9f",
+    "commit": "306086899f34ee35c1414e62614c5e24ecb5c9f6",
     "repository": "Fudan-CourseLens-Private",
-    "worker_tree": "ac29681f4fd558c6b0ccf93e40288ae72e12a172"
+    "worker_tree": "c556b640766b5122f42e727ee70ab1b704bc0b58"
   }
 }
