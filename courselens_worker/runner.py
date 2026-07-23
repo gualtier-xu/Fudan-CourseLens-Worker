@@ -69,11 +69,13 @@ def safe_worker_error_detail(error: BaseException) -> str:
     if type(error).__name__ == "PlatformSessionError":
         value = str(error)
         connection_stage = str(getattr(error, "connection_stage", "") or "")
-        if value == "platform_connection_failed" and connection_stage:
+        if value in {
+            "platform_connection_failed", "platform_session_rejected",
+        } and connection_stage:
             from .platform_session import _CONNECTION_STAGES
 
             if connection_stage in _CONNECTION_STAGES:
-                return f"platform_connection_failed_{connection_stage}"
+                return f"{value}_{connection_stage}"
         return value if value in {
             "platform_credentials_missing", "platform_connection_failed",
             "platform_redirect_rejected", "platform_auth_context_missing",

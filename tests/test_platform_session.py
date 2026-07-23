@@ -58,8 +58,26 @@ class PlatformSessionTests(unittest.TestCase):
         connector.session = Mock()
         connector.session.cookies.items.return_value = [("session", "value\r\ninjected")]
 
-        with self.assertRaisesRegex(PlatformSessionError, "platform_session_rejected"):
+        with self.assertRaisesRegex(PlatformSessionError, "platform_session_rejected") as captured:
             connector._source_headers()
+        self.assertEqual(captured.exception.connection_stage, "course_request")
+        self.assertEqual(
+            safe_worker_error_detail(captured.exception),
+            "platform_session_rejected_course_request",
+        )
+
+    def test_session_rejection_retains_only_a_closed_set_stage(self):
+        error = PlatformSessionError(
+            "platform_session_rejected", connection_stage="course_verify_direct"
+        )
+        self.assertEqual(
+            safe_worker_error_detail(error),
+            "platform_session_rejected_course_verify_direct",
+        )
+        redacted = PlatformSessionError(
+            "platform_session_rejected", connection_stage="secret-host-and-path"
+        )
+        self.assertEqual(safe_worker_error_detail(redacted), "platform_session_rejected")
 
     def test_login_prefers_direct_course_session_after_webvpn(self):
         connector = object.__new__(PlatformSession)

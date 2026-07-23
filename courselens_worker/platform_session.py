@@ -350,7 +350,7 @@ class PlatformSession:
             finally:
                 response.close()
         if not self._verify_webvpn():
-            raise _fail("platform_session_rejected")
+            raise _fail("platform_session_rejected", connection_stage="webvpn_verify")
 
     def _verify_webvpn(self) -> bool:
         response = None
@@ -398,7 +398,10 @@ class PlatformSession:
             if decoded == encoded:
                 break
             encoded = decoded
-        raise _fail("platform_session_rejected")
+        raise _fail(
+            "platform_session_rejected",
+            connection_stage="course_ticket_follow_direct",
+        )
 
     def _login_course_direct(self, account: str, password: str) -> None:
         cas = (
@@ -476,7 +479,10 @@ class PlatformSession:
         self._course_bearer = self._extract_course_bearer()
         if not self._verify_course_direct():
             self._course_bearer = ""
-            raise _fail("platform_session_rejected")
+            raise _fail(
+                "platform_session_rejected",
+                connection_stage="course_verify_direct",
+            )
         self._course_direct = True
 
     def _verify_course_direct(self) -> bool:
@@ -575,7 +581,7 @@ class PlatformSession:
             finally:
                 response.close()
         if not self._verify_course():
-            raise _fail("platform_session_rejected")
+            raise _fail("platform_session_rejected", connection_stage="course_verify")
 
     def _verify_course(self) -> bool:
         response = None
@@ -822,12 +828,16 @@ class PlatformSession:
         try:
             cookie_items = list(self.session.cookies.items())
         except (AttributeError, TypeError) as exc:
-            raise _fail("platform_session_rejected") from exc
+            raise _fail(
+                "platform_session_rejected", connection_stage="course_request"
+            ) from exc
         normalized: list[tuple[str, str]] = []
         for raw_name, raw_value in cookie_items:
             name, value = str(raw_name or ""), str(raw_value or "")
             if not name or any(char in name or char in value for char in "\r\n"):
-                raise _fail("platform_session_rejected")
+                raise _fail(
+                    "platform_session_rejected", connection_stage="course_request"
+                )
             normalized.append((name, value))
         cookies = "; ".join(f"{name}={value}" for name, value in normalized)
         return {
