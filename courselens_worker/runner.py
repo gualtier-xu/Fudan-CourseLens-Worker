@@ -176,16 +176,13 @@ class SignedProgressPublisher:
                     self._send_locked(self._latest, now)
 
 
-def process_job(
+def _process_materialized_job(
     job: dict[str, Any],
     *,
     checkpoint_writer=None,
     progress_callback=None,
 ) -> dict[str, Any]:
     progress = progress_callback or _progress
-    if dict(job.get("payload") or {}).get("source_session"):
-        from .platform_session import materialize_job_sources
-        job = materialize_job_sources(job)
     kind = str(job["job_kind"])
     started = time.monotonic()
     if kind == "echo":
@@ -343,6 +340,29 @@ def process_job(
         "metrics": metrics,
         "warnings": [],
     }
+
+
+def process_job(
+    job: dict[str, Any],
+    *,
+    checkpoint_writer=None,
+    progress_callback=None,
+) -> dict[str, Any]:
+    if dict(job.get("payload") or {}).get("source_session"):
+        from .platform_session import materialize_job_sources
+        job = materialize_job_sources(job)
+    payload = dict(job.get("payload") or {})
+    close_source_session = payload.pop("_close_source_session", None)
+    job = {**job, "payload": payload}
+    try:
+        return _process_materialized_job(
+            job,
+            checkpoint_writer=checkpoint_writer,
+            progress_callback=progress_callback,
+        )
+    finally:
+        if callable(close_source_session):
+            close_source_session()
 
 
 def run() -> int:

@@ -188,6 +188,43 @@ class PlatformSessionTests(unittest.TestCase):
         self.assertEqual(result["payload"]["media"]["start_seconds"], 600)
         self.assertEqual(len(result["payload"]["slides"]), 1)
 
+    def test_materialization_retains_only_refreshable_session_until_cleanup(self):
+        closed = []
+
+        class RefreshableConnector(_FakeConnector):
+            def close(self):
+                closed.append(True)
+
+            def media_source(self, course_id, sub_id):
+                return {
+                    "url": "https://example.org/stream.mp4",
+                    "_refresh_source": lambda: {
+                        "url": "https://example.org/stream.mp4"
+                    },
+                }
+
+        job = {
+            "payload": {
+                "media": {"duration_seconds": 60},
+                "source_session": {
+                    "provider": "runner-session-v1", "course_id": "1",
+                    "sub_id": "2", "media": True, "slides": False,
+                },
+            },
+            "secrets": {
+                "source_credentials": {"account": "account", "password": "password"}
+            },
+        }
+        with patch("courselens_worker.platform_session.PlatformSession", RefreshableConnector):
+            result = materialize_job_sources(job)
+
+        self.assertEqual(closed, [])
+        closer = result["payload"].pop("_close_source_session")
+        self.assertTrue(callable(closer))
+        closer()
+        self.assertEqual(closed, [True])
+        self.assertNotIn("source_credentials", result["secrets"])
+
     def _media_connector(self):
         connector = object.__new__(PlatformSession)
         connector._course_json = lambda *_args, **_kwargs: {
@@ -251,11 +288,42 @@ class PlatformSessionTests(unittest.TestCase):
         self.assertEqual(connector._sign.call_count, 2)
         self.assertIn("second", refreshed["url"])
 
+    def test_media_refresh_fetches_a_new_platform_base_url(self):
+        connector = self._media_connector()
+        connector._course_json = Mock(side_effect=[
+            {"data": {"now": 100, "video_list": {"main": {
+                "preview_url": "https://media.example.edu/lecture.mp4?base=first"
+            }}}},
+            {"data": {"now": 101, "video_list": {"main": {
+                "preview_url": "https://media.example.edu/lecture.mp4?base=second"
+            }}}},
+        ])
+        connector._sign = Mock(side_effect=lambda value, now: f"{value}&t={now}")
+        with (
+            patch("courselens_worker.platform_session.time.time", side_effect=[100, 100, 101, 101]),
+            patch(
+                "courselens_worker.source.resolve_source_address",
+                side_effect=lambda url, headers: ResolvedSource(
+                    url, headers, "93.184.216.34"
+                ),
+            ),
+        ):
+            source = connector.media_source("1", "2")
+            refreshed = source["_refresh_source"]()
+
+        self.assertEqual(connector._course_json.call_count, 2)
+        self.assertIn("base=first", connector._sign.call_args_list[0].args[0])
+        self.assertIn("base=second", connector._sign.call_args_list[1].args[0])
+        self.assertIn("base=second", refreshed["url"])
+
     def test_media_source_uses_strictly_increasing_signing_seconds(self):
         connector = self._media_connector()
         connector._sign = Mock(side_effect=lambda value, now: f"{value}?t={now}")
         with (
-            patch("courselens_worker.platform_session.time.time", side_effect=[100, 100, 100, 101]),
+            patch(
+                "courselens_worker.platform_session.time.time",
+                side_effect=[100, 100, 100, 100, 101],
+            ),
             patch("courselens_worker.platform_session.time.sleep") as sleep,
             patch(
                 "courselens_worker.source.resolve_source_address",

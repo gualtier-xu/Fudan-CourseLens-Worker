@@ -725,7 +725,7 @@ class PlatformSession:
         separator = "&" if "?" in media_url else "?"
         return f"{media_url}{separator}clientUUID={uuid.uuid4()}&t={token}"
 
-    def media_source(self, course_id: str, sub_id: str) -> dict[str, Any]:
+    def _media_base(self, course_id: str, sub_id: str) -> tuple[str, int]:
         data = self._course_json(
             "/courseapi/v3/portal-home-setting/get-sub-info",
             params={"course_id": course_id, "sub_id": sub_id},
@@ -752,11 +752,14 @@ class PlatformSession:
             base = str((((detail.get("data") or {}).get("content") or {}).get("playback") or {}).get("url") or "")
         if not base or not urlparse(base).path.lower().endswith(".mp4"):
             raise _fail("platform_media_missing")
-        server_now = int(info.get("now") or 0)
-        clock_offset = server_now - int(time.time()) if server_now else 0
+        return base, int(info.get("now") or 0)
+
+    def media_source(self, course_id: str, sub_id: str) -> dict[str, Any]:
         # A signed CDN URL may authorize only one media request. The desktop
         # client already obtains a new URL per browser Range; expose the same
-        # behavior to the runner's in-memory proxy without retaining cookies.
+        # behavior to the runner's in-memory proxy without retaining account
+        # credentials. The platform's base preview URL is also short-lived, so
+        # every refresh must obtain a new base before applying the CDN signature.
         from .source import SourceSecurityError, resolve_source_address
 
         direct_headers = {
@@ -766,21 +769,25 @@ class PlatformSession:
         }
         sign_lock = threading.Lock()
         last_signed_at = 0
+        latest_signed_url = ""
 
         def refresh_source() -> dict[str, Any]:
-            nonlocal last_signed_at
+            nonlocal last_signed_at, latest_signed_url
             # The CDN rejects a repeated byte range when two otherwise fresh
             # URLs carry the same second-granularity signing timestamp. FFmpeg
             # legitimately repeats MP4 index ranges, so serialize issuance and
             # wait for the next real server-aligned second instead of inventing
             # a future timestamp or retrying a rejected URL.
             with sign_lock:
+                base, server_now = self._media_base(course_id, sub_id)
+                clock_offset = server_now - int(time.time()) if server_now else 0
                 signed_at = int(time.time()) + clock_offset
                 while signed_at <= last_signed_at:
                     time.sleep(max(0.01, min(1.0, last_signed_at + 1 - signed_at)))
                     signed_at = int(time.time()) + clock_offset
                 last_signed_at = signed_at
                 signed = self._sign(base, last_signed_at)
+                latest_signed_url = signed
             resolved = resolve_source_address(signed, direct_headers)
             return {
                 "url": resolved.url,
@@ -791,8 +798,9 @@ class PlatformSession:
         try:
             source = refresh_source()
         except SourceSecurityError:
-            signed = self._sign(base, int(time.time()) + clock_offset)
-            return {"url": _vpn_url(signed), "headers": self._source_headers()}
+            if not latest_signed_url:
+                raise
+            return {"url": _vpn_url(latest_signed_url), "headers": self._source_headers()}
         return {**source, "_refresh_source": refresh_source}
 
     def slide_sources(self, course_id: str, sub_id: str) -> list[dict[str, Any]]:
@@ -870,6 +878,8 @@ def materialize_job_sources(job: dict[str, Any]) -> dict[str, Any]:
     password = str(credentials.pop("password", "") or "")
     credentials.clear()
     connector: PlatformSession | None = None
+    retained_connector = False
+    retain_for_media_refresh = False
     try:
         for attempt in range(3):
             connector = PlatformSession()
@@ -890,10 +900,14 @@ def materialize_job_sources(job: dict[str, Any]) -> dict[str, Any]:
             media = dict(payload.get("media") or {})
             media.update(connector.media_source(course_id, sub_id))
             payload["media"] = media
+            retain_for_media_refresh = callable(media.get("_refresh_source"))
         if request.get("slides"):
             payload["slides"] = connector.slide_sources(course_id, sub_id)
+        if retain_for_media_refresh:
+            payload["_close_source_session"] = connector.close
+            retained_connector = True
     finally:
-        if connector is not None:
+        if connector is not None and not retained_connector:
             connector.close()
         account = ""
         password = ""

@@ -134,8 +134,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/platform_session.py",
-        "sha256": "b33072fc37bcec1f551d07e6a6b5633e7a683f9f48d30f60dbc3a3f825e1e63b",
-        "size": 38078
+        "sha256": "1cfc3317ab95efd920f27983748a0cc440f9413ad7ded53ca18f387ddcfad768",
+        "size": 38797
       },
       {
         "mode": "100644",
@@ -146,8 +146,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/runner.py",
-        "sha256": "40bdc0c1903ea2a9f26dd355f071e7575a9f41d3125e34fa285118f166a06f00",
-        "size": 19406
+        "sha256": "0da59ac0a2f417786ad18d8e2621f338a5ff4435b7cad7f200b274528531e66d",
+        "size": 19968
       },
       {
         "mode": "100644",
@@ -266,8 +266,8 @@
       {
         "mode": "100644",
         "path": "tests/test_platform_session.py",
-        "sha256": "1edaae663584ef61c8b7f25fcca7b8dcd91ac8898e3e2d2a407cecd5d09704c6",
-        "size": 15598
+        "sha256": "ab3772902618af3aebb621997b17216939fc9aec1842662a2a82a68367fa0926",
+        "size": 18339
       },
       {
         "mode": "100644",
@@ -278,8 +278,8 @@
       {
         "mode": "100644",
         "path": "tests/test_runner_echo.py",
-        "sha256": "1b54f07ca348f2f7d292f5b505c01bd7ea52ac76a7c5050a2505a505560c639f",
-        "size": 712
+        "sha256": "9c1cdfc3b0133191aa1332c9f4b252d435e04bd652f60cd90bdd9e7c1fa2044e",
+        "size": 1810
       },
       {
         "mode": "100644",
@@ -300,8 +300,8 @@
         "size": 2967
       }
     ],
-    "git_tree": "d3e32eed7cdc43afd718f31a641548bd19518b5f",
-    "tree_sha256": "72a27488ed356354bf96039fb47cf39c0f5b12f8be98c37cf0d5f07904f7e050"
+    "git_tree": "2151a7eaeb4b82f7e2342a0706747582ba138379",
+    "tree_sha256": "8deb368d5c22fba3fbdef11acac6ce0bba468058fd60602432f64193c66dfe71"
   },
   "protocol": {
     "supported_versions": [
@@ -310,8 +310,8 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "7752245391f08311ba0c6f1e2d8853bdbc59ec55",
+    "commit": "801178c2fe43067e7110e566898a0e6eaaec8b9f",
     "repository": "Fudan-CourseLens-Private",
-    "worker_tree": "8392b09ad271abc1319f022f69149f69dad2b661"
+    "worker_tree": "ac29681f4fd558c6b0ccf93e40288ae72e12a172"
   }
 }
