@@ -28,7 +28,8 @@ class ASRProxyLifecycleTests(unittest.TestCase):
             patch.object(asr, "pinned_media_proxy") as media_proxy,
             patch.object(asr, "_decode_chunk_from_url", side_effect=create_pcm) as decode,
         ):
-            media_proxy.return_value.__enter__.return_value.url = "http://127.0.0.1/session"
+            proxy = media_proxy.return_value.__enter__.return_value
+            proxy.url = "http://127.0.0.1/session"
             result = asr.transcribe(
                 {
                     "payload": {
@@ -46,6 +47,7 @@ class ASRProxyLifecycleTests(unittest.TestCase):
             )
 
         media_proxy.assert_called_once()
+        self.assertEqual(proxy.refresh_source.call_count, 2)
         self.assertEqual(decode.call_count, 3)
         self.assertEqual(
             [item.args[0] for item in decode.call_args_list],

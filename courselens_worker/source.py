@@ -367,6 +367,10 @@ class PinnedMediaProxy:
     def failure_code(self) -> str:
         return str(self._server.failure_code or "")
 
+    def refresh_source(self) -> None:
+        """Rotate the hidden upstream authorization without changing the loopback URL."""
+        self._server.refresh_source()
+
 
 class _PinnedConnectServer(socketserver.ThreadingTCPServer):
     """Loopback-only CONNECT proxy fixed to one validated upstream address."""
@@ -595,11 +599,9 @@ def pinned_media_proxy(source: dict[str, Any]) -> Iterator[PinnedMediaProxy]:
     refresh = source.get("_refresh_source")
     refresh_callback = refresh if callable(refresh) else None
     if refresh_callback is not None:
-        # One FFmpeg invocation may request the MP4 index and media ranges
-        # several times. The CDN expects those requests to share one signed
-        # URL, while a later decode chunk needs a new URL. Each decode chunk
-        # creates a new proxy context, so refresh exactly once here rather than
-        # once per Range request.
+        # Start the proxy with a newly issued authorization. Long-running ASR
+        # keeps this proxy context alive and explicitly rotates the hidden
+        # source between bounded decode chunks.
         refreshed = dict(refresh_callback() or {})
         source_url = str(refreshed.get("url") or "")
         headers = safe_headers(refreshed.get("headers"))

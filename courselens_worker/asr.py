@@ -322,12 +322,15 @@ def transcribe(
     started = time.monotonic()
     # Keep one authorized CDN playback session for the complete task.  The
     # runner still launches one bounded FFmpeg process and retains only one
-    # transient PCM file per chunk.  The loopback proxy refreshes its upstream
-    # authorization once on a real 401/403, so a long lecture can recover from
-    # expiry without creating a new CDN playback identity every ten minutes.
+    # transient PCM file per chunk. Rotate the proxy's hidden signed URL before
+    # each later chunk so an expired URL is never the first request of a new
+    # decode session; a real 401/403 inside a chunk still gets only one bounded
+    # refresh retry in the proxy.
     with tempfile.TemporaryDirectory(prefix="courselens-pcm-") as temporary, pinned_media_proxy(source) as proxy:
         root = Path(temporary)
         for index in range(completed_chunks, total_chunks):
+            if index > completed_chunks:
+                proxy.refresh_source()
             relative_offset = index * PCM_CHUNK_SECONDS
             absolute_offset = start_seconds + relative_offset
             chunk_duration = min(PCM_CHUNK_SECONDS, duration - relative_offset)
