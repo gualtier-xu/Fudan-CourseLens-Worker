@@ -12,6 +12,7 @@ from courselens_worker.platform_session import (
     PlatformSession,
     PlatformSessionError,
     _validate_url,
+    cloud_session_from_environment,
     materialize_job_sources,
 )
 from courselens_worker.runner import safe_worker_error_detail
@@ -441,6 +442,33 @@ class PlatformSessionTests(unittest.TestCase):
             with self.assertRaises(PlatformSessionError):
                 materialize_job_sources(rejected)
         self.assertEqual(RejectedConnector.attempts, 1)
+
+    def test_cloud_login_rebuilds_transient_rejected_sessions(self):
+        class FlakyConnector(_FakeConnector):
+            attempts = 0
+
+            def login(self, account, password):
+                type(self).attempts += 1
+                if type(self).attempts < 3:
+                    raise PlatformSessionError("platform_session_rejected")
+                super().login(account, password)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "COURSELENS_CLOUD_STUDENT_ID": "student",
+                    "COURSELENS_CLOUD_PASSWORD": "password",
+                },
+                clear=True,
+            ),
+            patch("courselens_worker.platform_session.PlatformSession", FlakyConnector),
+            patch("courselens_worker.platform_session.time.sleep") as sleep,
+        ):
+            connector = cloud_session_from_environment()
+        connector.close()
+        self.assertEqual(FlakyConnector.attempts, 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_connection_failure_retains_only_a_closed_set_stage(self):
         connector = PlatformSession()

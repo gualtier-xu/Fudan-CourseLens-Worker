@@ -46,6 +46,11 @@ _ALLOWED_HOSTS = {
 }
 _REDIRECTS = {301, 302, 303, 307, 308}
 _MAX_REDIRECTS = 8
+_RETRYABLE_LOGIN_ERRORS = frozenset({
+    "platform_connection_failed",
+    "platform_ticket_rejected",
+    "platform_session_rejected",
+})
 
 
 _CONNECTION_STAGES = frozenset({
@@ -1012,7 +1017,7 @@ def materialize_job_sources(job: dict[str, Any]) -> dict[str, Any]:
             except PlatformSessionError as exc:
                 connector.close()
                 connector = None
-                if str(exc) != "platform_connection_failed" or attempt == 2:
+                if str(exc) not in _RETRYABLE_LOGIN_ERRORS or attempt == 2:
                     raise
                 time.sleep(1.5 * (attempt + 1))
         if connector is None:
@@ -1055,7 +1060,7 @@ def cloud_session_from_environment() -> PlatformSession:
                 return connector
             except PlatformSessionError as exc:
                 connector.close()
-                if str(exc) != "platform_connection_failed" or attempt == 2:
+                if str(exc) not in _RETRYABLE_LOGIN_ERRORS or attempt == 2:
                     raise
                 time.sleep(1.5 * (attempt + 1))
     finally:
