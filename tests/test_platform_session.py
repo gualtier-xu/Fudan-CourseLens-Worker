@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 
 import requests
 
+from curl_cffi import requests as curl_requests
 from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 from courselens_worker.platform_session import (
     PlatformSession,
@@ -41,6 +42,25 @@ class _FakeConnector:
 
 
 class PlatformSessionTests(unittest.TestCase):
+    def test_source_headers_support_curl_cookie_mapping(self):
+        connector = object.__new__(PlatformSession)
+        connector.session = curl_requests.Session(impersonate="chrome")
+        try:
+            connector.session.cookies.set("session", "sealed")
+            headers = connector._source_headers()
+        finally:
+            connector.session.close()
+
+        self.assertEqual(headers["Cookie"], "session=sealed")
+
+    def test_source_headers_reject_control_characters(self):
+        connector = object.__new__(PlatformSession)
+        connector.session = Mock()
+        connector.session.cookies.items.return_value = [("session", "value\r\ninjected")]
+
+        with self.assertRaisesRegex(PlatformSessionError, "platform_session_rejected"):
+            connector._source_headers()
+
     def test_login_prefers_direct_course_session_after_webvpn(self):
         connector = object.__new__(PlatformSession)
         connector._login_webvpn = Mock()

@@ -819,7 +819,17 @@ class PlatformSession:
         return items
 
     def _source_headers(self) -> dict[str, str]:
-        cookies = "; ".join(f"{cookie.name}={cookie.value}" for cookie in self.session.cookies)
+        try:
+            cookie_items = list(self.session.cookies.items())
+        except (AttributeError, TypeError) as exc:
+            raise _fail("platform_session_rejected") from exc
+        normalized: list[tuple[str, str]] = []
+        for raw_name, raw_value in cookie_items:
+            name, value = str(raw_name or ""), str(raw_value or "")
+            if not name or any(char in name or char in value for char in "\r\n"):
+                raise _fail("platform_session_rejected")
+            normalized.append((name, value))
+        cookies = "; ".join(f"{name}={value}" for name, value in normalized)
         return {
             "Cookie": cookies,
             "User-Agent": USER_AGENT,
