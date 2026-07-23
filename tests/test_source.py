@@ -269,6 +269,46 @@ class SourceSecurityTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
 
     @patch("courselens_worker.source._request_once")
+    def test_loopback_proxy_uses_bounded_authenticated_fallback(self, request):
+        request.side_effect = [
+            (Mock(), FakeResponse(403)),
+            (Mock(), FakeResponse(403)),
+            (Mock(), FakeResponse(206, body=b"ok")),
+        ]
+        direct_calls = []
+        fallback_calls = []
+
+        def refresh():
+            direct_calls.append(len(direct_calls) + 1)
+            return {
+                "url": f"https://media.example.com/video?request={direct_calls[-1]}",
+                "resolved_public_ip": "93.184.216.34",
+            }
+
+        def fallback():
+            fallback_calls.append(len(fallback_calls) + 1)
+            return {
+                "url": f"https://vpn.example.com/media?request={fallback_calls[-1]}",
+                "headers": {"Cookie": "sealed"},
+                "resolved_public_ip": "93.184.216.35",
+            }
+
+        source = {
+            **refresh(),
+            "_refresh_source": refresh,
+            "_fallback_source": fallback,
+        }
+        with pinned_media_proxy(source) as proxy:
+            probe = urllib.request.Request(proxy.url, headers={"Range": "bytes=0-1"})
+            with urllib.request.urlopen(probe, timeout=5) as response:
+                self.assertEqual(response.read(), b"ok")
+            self.assertEqual(proxy.failure_code, "")
+        self.assertEqual(len(direct_calls), 3)
+        self.assertEqual(len(fallback_calls), 1)
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(request.call_args_list[-1].args[2], "93.184.216.35")
+
+    @patch("courselens_worker.source._request_once")
     def test_loopback_proxy_rotates_hidden_source_at_chunk_boundary(self, request):
         request.side_effect = lambda *_args, **_kwargs: (Mock(), FakeResponse(
             206,

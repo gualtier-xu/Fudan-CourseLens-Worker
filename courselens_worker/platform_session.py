@@ -770,10 +770,9 @@ class PlatformSession:
         sign_lock = threading.Lock()
         clock_offset: int | None = None
         last_signed_at = 0
-        latest_signed_url = ""
 
-        def refresh_source() -> dict[str, Any]:
-            nonlocal clock_offset, last_signed_at, latest_signed_url
+        def issue_signed_url() -> str:
+            nonlocal clock_offset, last_signed_at
             # The CDN rejects a repeated byte range when two otherwise fresh
             # URLs carry the same second-granularity signing timestamp. FFmpeg
             # legitimately repeats MP4 index ranges, so serialize issuance and
@@ -793,8 +792,10 @@ class PlatformSession:
                     time.sleep(max(0.01, min(1.0, last_signed_at + 1 - signed_at)))
                     signed_at = int(time.time()) + clock_offset
                 last_signed_at = signed_at
-                signed = self._sign(base, last_signed_at)
-                latest_signed_url = signed
+                return self._sign(base, last_signed_at)
+
+        def refresh_source() -> dict[str, Any]:
+            signed = issue_signed_url()
             resolved = resolve_source_address(signed, direct_headers)
             return {
                 "url": resolved.url,
@@ -802,13 +803,21 @@ class PlatformSession:
                 "resolved_public_ip": resolved.ip,
             }
 
+        def fallback_source() -> dict[str, Any]:
+            return {
+                "url": _vpn_url(issue_signed_url()),
+                "headers": self._source_headers(),
+            }
+
         try:
             source = refresh_source()
         except SourceSecurityError:
-            if not latest_signed_url:
-                raise
-            return {"url": _vpn_url(latest_signed_url), "headers": self._source_headers()}
-        return {**source, "_refresh_source": refresh_source}
+            return {**fallback_source(), "_refresh_source": fallback_source}
+        return {
+            **source,
+            "_refresh_source": refresh_source,
+            "_fallback_source": fallback_source,
+        }
 
     def slide_sources(self, course_id: str, sub_id: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []

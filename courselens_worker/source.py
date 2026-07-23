@@ -334,9 +334,12 @@ class _PinnedRangeProxy(http.server.ThreadingHTTPServer):
         resolved: ResolvedSource,
         path: str,
         refresh: Callable[[], dict[str, Any]] | None = None,
+        fallback: Callable[[], dict[str, Any]] | None = None,
     ):
         self.resolved = resolved
         self.refresh = refresh
+        self.fallback = fallback
+        self._fallback_active = False
         self._refresh_lock = threading.Lock()
         self.media_path = path
         self.failure_code = ""
@@ -346,10 +349,11 @@ class _PinnedRangeProxy(http.server.ThreadingHTTPServer):
         return self.resolved
 
     def refresh_source(self) -> ResolvedSource:
-        if self.refresh is None:
+        callback = self.fallback if self._fallback_active else self.refresh
+        if callback is None:
             return self.resolved
         with self._refresh_lock:
-            value = dict(self.refresh() or {})
+            value = dict(callback() or {})
             refreshed_url = str(value.get("url") or "")
             current = urlsplit(self.resolved.url)
             refreshed = urlsplit(refreshed_url)
@@ -375,6 +379,19 @@ class _PinnedRangeProxy(http.server.ThreadingHTTPServer):
                 # avoids drifting between CDN edges mid-decode.
                 public_ip_hint=self.resolved.ip,
             )
+            return self.resolved
+
+    def activate_fallback_source(self) -> ResolvedSource:
+        if self.fallback is None or self._fallback_active:
+            return self.resolved
+        with self._refresh_lock:
+            value = dict(self.fallback() or {})
+            self.resolved = resolve_source_address(
+                str(value.get("url") or ""),
+                safe_headers(value.get("headers")),
+                public_ip_hint=str(value.get("resolved_public_ip") or ""),
+            )
+            self._fallback_active = True
             return self.resolved
 
 
@@ -562,6 +579,22 @@ class _PinnedRangeHandler(http.server.BaseHTTPRequestHandler):
                 response = connection = None
                 resolved = self.server.refresh_source()
                 connection, response = request(resolved)
+            if (
+                response.status in {401, 403}
+                and self.server.fallback is not None
+                and not self.server._fallback_active
+            ):
+                # GitHub-hosted runners can traverse a different CDN edge on
+                # later Range requests. After one fresh direct capability is
+                # rejected, switch this proxy session to the authenticated
+                # fallback supplied by the platform adapter. The fallback is
+                # still HTTPS, public-address validated, loopback-hidden, and
+                # bounded to one additional retry.
+                response.close()
+                connection.close()
+                response = connection = None
+                resolved = self.server.activate_fallback_source()
+                connection, response = request(resolved)
             status = int(response.status)
             if status not in {200, 206, 416}:
                 if status in {301, 302, 303, 307, 308}:
@@ -618,6 +651,8 @@ def pinned_media_proxy(source: dict[str, Any]) -> Iterator[PinnedMediaProxy]:
     public_ip_hint = str(source.get("resolved_public_ip") or "")
     refresh = source.get("_refresh_source")
     refresh_callback = refresh if callable(refresh) else None
+    fallback = source.get("_fallback_source")
+    fallback_callback = fallback if callable(fallback) else None
     if refresh_callback is not None:
         # Start the proxy with a newly issued authorization. Long-running ASR
         # keeps this proxy context alive and explicitly rotates the hidden
@@ -635,7 +670,7 @@ def pinned_media_proxy(source: dict[str, Any]) -> Iterator[PinnedMediaProxy]:
         public_ip_hint=public_ip_hint,
     )
     path = f"/{secrets.token_urlsafe(24)}"
-    server = _PinnedRangeProxy(resolved, path, refresh_callback)
+    server = _PinnedRangeProxy(resolved, path, refresh_callback, fallback_callback)
     thread = threading.Thread(target=server.serve_forever, name="courselens-range-proxy", daemon=True)
     thread.start()
     try:
