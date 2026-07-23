@@ -4,12 +4,16 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.parse import urlsplit
 
+import requests
+
+from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 from courselens_worker.platform_session import (
     PlatformSession,
     PlatformSessionError,
     _validate_url,
     materialize_job_sources,
 )
+from courselens_worker.runner import safe_worker_error_detail
 from courselens_worker.source import ResolvedSource, SourceSecurityError
 
 
@@ -217,6 +221,53 @@ class PlatformSessionTests(unittest.TestCase):
             with self.assertRaises(PlatformSessionError):
                 materialize_job_sources(rejected)
         self.assertEqual(RejectedConnector.attempts, 1)
+
+    def test_connection_failure_retains_only_a_closed_set_stage(self):
+        connector = PlatformSession()
+        connector.session.request = Mock(
+            side_effect=requests.ConnectionError("secret URL must not escape")
+        )
+        with self.assertRaises(PlatformSessionError) as captured:
+            connector._once(
+                "GET",
+                "https://webvpn.fudan.edu.cn/",
+                connection_stage="webvpn_context",
+            )
+        self.assertEqual(str(captured.exception), "platform_connection_failed")
+        self.assertEqual(captured.exception.connection_stage, "webvpn_context")
+        self.assertEqual(
+            safe_worker_error_detail(captured.exception),
+            "platform_connection_failed_webvpn_context",
+        )
+
+        with self.assertRaises(PlatformSessionError) as captured:
+            connector._once(
+                "GET",
+                "https://webvpn.fudan.edu.cn/",
+                connection_stage="secret-host-and-path",
+            )
+        self.assertEqual(captured.exception.connection_stage, "")
+        self.assertEqual(
+            safe_worker_error_detail(captured.exception),
+            "platform_connection_failed",
+        )
+
+    def test_curl_transport_failure_uses_the_same_closed_stage(self):
+        connector = PlatformSession()
+        connector.session.request = Mock(
+            side_effect=CurlRequestException("secret URL must not escape")
+        )
+        with self.assertRaises(PlatformSessionError) as captured:
+            connector._once(
+                "GET",
+                "https://webvpn.fudan.edu.cn/",
+                connection_stage="webvpn_ticket_follow",
+            )
+        self.assertEqual(str(captured.exception), "platform_connection_failed")
+        self.assertEqual(
+            safe_worker_error_detail(captured.exception),
+            "platform_connection_failed_webvpn_ticket_follow",
+        )
 
 
 if __name__ == "__main__":

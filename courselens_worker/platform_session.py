@@ -24,6 +24,8 @@ from urllib.parse import quote, urljoin, urlparse
 import requests
 from Crypto.Cipher import AES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
+from curl_cffi import requests as curl_requests
+from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 
 
 WEBVPN_BASE = "https://webvpn.fudan.edu.cn"
@@ -46,12 +48,37 @@ _REDIRECTS = {301, 302, 303, 307, 308}
 _MAX_REDIRECTS = 8
 
 
+_CONNECTION_STAGES = frozenset({
+    "webvpn_context",
+    "webvpn_auth_methods",
+    "webvpn_key",
+    "webvpn_auth_execute",
+    "webvpn_ticket",
+    "webvpn_ticket_follow",
+    "webvpn_verify",
+    "course_context",
+    "course_auth_methods",
+    "course_key",
+    "course_auth_execute",
+    "course_ticket",
+    "course_ticket_follow",
+    "course_verify",
+    "course_request",
+})
+
+
 class PlatformSessionError(RuntimeError):
     """Closed-set failure suitable for reduction in public logs."""
 
+    def __init__(self, code: str, *, connection_stage: str = "") -> None:
+        super().__init__(code)
+        self.connection_stage = (
+            str(connection_stage) if connection_stage in _CONNECTION_STAGES else ""
+        )
 
-def _fail(code: str) -> PlatformSessionError:
-    return PlatformSessionError(code)
+
+def _fail(code: str, *, connection_stage: str = "") -> PlatformSessionError:
+    return PlatformSessionError(code, connection_stage=connection_stage)
 
 
 def _validate_url(value: str) -> str:
@@ -130,25 +157,47 @@ class PlatformSession:
     """Narrow session capable only of authorizing one requested lecture."""
 
     def __init__(self) -> None:
-        self.session = requests.Session()
+        self.session = curl_requests.Session(impersonate="chrome")
         self.session.headers.update({"User-Agent": USER_AGENT})
         self._userinfo: dict[str, Any] | None = None
 
-    def _once(self, method: str, url: str, **kwargs) -> requests.Response:
+    def _once(
+        self,
+        method: str,
+        url: str,
+        *,
+        connection_stage: str = "",
+        **kwargs,
+    ) -> requests.Response:
         target = _validate_url(url)
         kwargs["allow_redirects"] = False
         kwargs.setdefault("timeout", (10, 60))
         try:
             return self.session.request(method, target, **kwargs)
-        except requests.RequestException as exc:
-            raise _fail("platform_connection_failed") from exc
+        except (requests.RequestException, CurlRequestException) as exc:
+            raise _fail(
+                "platform_connection_failed",
+                connection_stage=connection_stage,
+            ) from exc
 
-    def _follow(self, method: str, url: str, **kwargs) -> tuple[requests.Response, list[str]]:
+    def _follow(
+        self,
+        method: str,
+        url: str,
+        *,
+        connection_stage: str = "",
+        **kwargs,
+    ) -> tuple[requests.Response, list[str]]:
         current = _validate_url(url)
         current_method = method.upper()
         trace = [current]
         for _ in range(_MAX_REDIRECTS + 1):
-            response = self._once(current_method, current, **kwargs)
+            response = self._once(
+                current_method,
+                current,
+                connection_stage=connection_stage,
+                **kwargs,
+            )
             status = int(response.status_code)
             if status not in _REDIRECTS:
                 return response, trace
@@ -198,7 +247,9 @@ class PlatformSession:
         current = f"{IDP_BASE}/idp/authCenter/authenticate?service={quote(service, safe='')}"
         lck = ""
         for _ in range(_MAX_REDIRECTS + 1):
-            response = self._once("GET", current)
+            response = self._once(
+                "GET", current, connection_stage="webvpn_context"
+            )
             location = response.headers.get("Location", "")
             status = response.status_code
             response.close()
@@ -216,11 +267,13 @@ class PlatformSession:
             "POST", f"{IDP_BASE}/idp/authn/queryAuthMethods",
             json={"lck": lck, "entityId": WEBVPN_BASE},
             headers={"Content-Type": "application/json", "Referer": f"{IDP_BASE}/ac/", "Origin": IDP_BASE},
+            connection_stage="webvpn_auth_methods",
         ), "platform_auth_method_missing")
         chain, request_type = self._auth_method(method_data)
         key_data = _json(self._once(
             "GET", f"{IDP_BASE}/idp/authn/getJsPublicKey",
             headers={"Referer": f"{IDP_BASE}/ac/"},
+            connection_stage="webvpn_key",
         ), "platform_key_rejected")
         encrypted = self._encrypt_password(password, str(key_data.get("data") or ""))
         auth_data = _json(self._once(
@@ -231,6 +284,7 @@ class PlatformSession:
                 "authPara": {"loginName": account, "password": encrypted, "verifyCode": ""},
             },
             headers={"Content-Type": "application/json", "Referer": f"{IDP_BASE}/ac/", "Origin": IDP_BASE},
+            connection_stage="webvpn_auth_execute",
         ), "platform_auth_failed")
         if str(auth_data.get("code")) != "200" or not auth_data.get("loginToken"):
             raise _fail("platform_auth_failed")
@@ -238,11 +292,18 @@ class PlatformSession:
             "POST", f"{IDP_BASE}/idp/authCenter/authnEngine",
             data={"loginToken": str(auth_data["loginToken"])},
             headers={"Referer": f"{IDP_BASE}/ac/", "Origin": IDP_BASE},
+            connection_stage="webvpn_ticket",
         )
         ticket = _ticket_from_html(ticket_response.text[:256 * 1024], "platform_ticket_missing")
         ticket_response.close()
         try:
-            response, _ = self._follow("GET", ticket, stream=True, timeout=(5, 12))
+            response, _ = self._follow(
+                "GET",
+                ticket,
+                stream=True,
+                timeout=(5, 12),
+                connection_stage="webvpn_ticket_follow",
+            )
         except PlatformSessionError as exc:
             # The portal can set its cookie before a streamed ticket response
             # times out. Never replay the single-use ticket; verify instead.
@@ -260,7 +321,13 @@ class PlatformSession:
     def _verify_webvpn(self) -> bool:
         response = None
         try:
-            response = self._once("GET", WEBVPN_BASE + "/", stream=True, timeout=(3, 8))
+            response = self._once(
+                "GET",
+                WEBVPN_BASE + "/",
+                stream=True,
+                timeout=(3, 8),
+                connection_stage="webvpn_verify",
+            )
             location = response.headers.get("Location", "")
             return (
                 response.status_code == 200
@@ -278,7 +345,9 @@ class PlatformSession:
             f"{ICOURSE_BASE}/casapi/index.php?r=auth/login&school_login=1"
             f"&tenant_code={TENANT_CODE}&forward={quote(ICOURSE_BASE + '/', safe='')}"
         )
-        response, trace = self._follow("GET", _vpn_url(cas))
+        response, trace = self._follow(
+            "GET", _vpn_url(cas), connection_stage="course_context"
+        )
         lck = ""
         try:
             for candidate in trace + [response.url]:
@@ -300,11 +369,13 @@ class PlatformSession:
             "POST", _vpn_url(f"{IDP_BASE}/idp/authn/queryAuthMethods"),
             json={"lck": lck, "entityId": ICOURSE_BASE},
             headers={"Content-Type": "application/json", "Referer": f"{idp_vpn}/ac/", "Origin": WEBVPN_BASE},
+            connection_stage="course_auth_methods",
         ), "platform_auth_method_missing")
         chain, request_type = self._auth_method(method_data)
         key_data = _json(self._once(
             "GET", _vpn_url(f"{IDP_BASE}/idp/authn/getJsPublicKey"),
             headers={"Referer": f"{idp_vpn}/ac/"},
+            connection_stage="course_key",
         ), "platform_key_rejected")
         encrypted = self._encrypt_password(password, str(key_data.get("data") or ""))
         auth_data = _json(self._once(
@@ -315,6 +386,7 @@ class PlatformSession:
                 "authPara": {"loginName": account, "password": encrypted, "verifyCode": ""},
             },
             headers={"Content-Type": "application/json", "Referer": f"{idp_vpn}/ac/", "Origin": WEBVPN_BASE},
+            connection_stage="course_auth_execute",
         ), "platform_auth_failed")
         if str(auth_data.get("code")) != "200" or not auth_data.get("loginToken"):
             raise _fail("platform_auth_failed")
@@ -322,13 +394,20 @@ class PlatformSession:
             "POST", _vpn_url(f"{IDP_BASE}/idp/authCenter/authnEngine"),
             data={"loginToken": str(auth_data["loginToken"])},
             headers={"Referer": f"{idp_vpn}/ac/", "Origin": WEBVPN_BASE},
+            connection_stage="course_ticket",
         )
         ticket = _ticket_from_html(ticket_response.text[:256 * 1024], "platform_ticket_missing")
         ticket_response.close()
         if urlparse(ticket).hostname != urlparse(WEBVPN_BASE).hostname:
             ticket = _vpn_url(ticket)
         try:
-            response, _ = self._follow("GET", ticket, stream=True, timeout=(5, 12))
+            response, _ = self._follow(
+                "GET",
+                ticket,
+                stream=True,
+                timeout=(5, 12),
+                connection_stage="course_ticket_follow",
+            )
         except PlatformSessionError as exc:
             if str(exc) != "platform_connection_failed" or not self._verify_course():
                 raise
@@ -344,7 +423,12 @@ class PlatformSession:
     def _verify_course(self) -> bool:
         response = None
         try:
-            response = self._once("GET", _vpn_url(f"{ICOURSE_BASE}/userapi/v1/infosimple"), timeout=(3, 8))
+            response = self._once(
+                "GET",
+                _vpn_url(f"{ICOURSE_BASE}/userapi/v1/infosimple"),
+                timeout=(3, 8),
+                connection_stage="course_verify",
+            )
             data = _json(response, "platform_session_rejected")
             return response.status_code == 200 and data.get("code") in (0, 200)
         except PlatformSessionError:
@@ -354,7 +438,12 @@ class PlatformSession:
                 response.close()
 
     def _course_json(self, path: str, *, params: dict[str, Any]) -> dict[str, Any]:
-        response = self._once("GET", _vpn_url(ICOURSE_BASE + path), params=params)
+        response = self._once(
+            "GET",
+            _vpn_url(ICOURSE_BASE + path),
+            params=params,
+            connection_stage="course_request",
+        )
         try:
             if response.status_code != 200:
                 raise _fail("platform_course_request_failed")
