@@ -133,20 +133,41 @@ class PlatformSessionTests(unittest.TestCase):
         self.assertEqual(request.args[:2], ("GET", "https://icourse.fudan.edu.cn/userapi/v1/infosimple"))
         self.assertEqual(request.kwargs["headers"], {"Authorization": "Bearer bounded-test-token"})
 
-    def test_authorized_catalog_requires_successful_detail_for_each_course(self):
+    def test_webvpn_personal_catalog_requires_bearer_and_rejects_global_fallback(self):
+        connector = object.__new__(PlatformSession)
+        connector._course_direct = False
+        connector.session = Mock()
+        connector._extract_course_bearer = Mock(return_value="bounded-test-token")
+        response = Mock(status_code=200)
+        response.json.return_value = {"code": 0, "list": []}
+        connector._once = Mock(return_value=response)
+
+        connector._course_json(
+            "/courseapi/v2/course-live/get-my-course-month",
+            params={"month": "2026-07"},
+            authorization_required=True,
+            timeout=(5, 15),
+        )
+
+        request = connector._once.call_args
+        self.assertIn("get-my-course-month", request.args[1])
+        self.assertEqual(request.kwargs["headers"], {"Authorization": "Bearer bounded-test-token"})
+        self.assertEqual(request.kwargs["timeout"], (5, 15))
+
+    def test_authorized_catalog_uses_identity_scoped_schedule_and_verifies_details(self):
         connector = object.__new__(PlatformSession)
         connector._userinfo = None
         calls = []
 
-        def course_json(path, *, params):
+        def course_json(path, *, params, **_kwargs):
             calls.append((path, dict(params)))
-            if path.endswith("get-course-list"):
-                if params["term"] == "24":
-                    return {"code": 0, "data": {"total": 2, "list": [
-                        {"id": "1", "title": "A", "term_name": "2026", "kkxy_name": "Dept"},
-                        {"id": "2", "title": "B", "term_name": "2026", "kkxy_name": "Dept"},
-                    ]}}
-                return {"code": 0, "data": {"total": 0, "list": []}}
+            if path.endswith("infosimple"):
+                return {"code": 0, "data": {"id": "u", "account": "student", "tenant_id": "222"}}
+            if path.endswith("get-my-course-month"):
+                return {"code": 0, "list": [{"course": [
+                    {"id": "1", "title": "A", "term_name": "2026", "kkxy_name": "Dept"},
+                    {"id": "2", "title": "B", "term_name": "2026", "kkxy_name": "Dept"},
+                ]}]}
             if params["course_id"] == "2":
                 raise PlatformSessionError("platform_course_request_failed")
             return {"code": 0, "data": {"title": "A", "realname": "Teacher", "sub_list": {}}}
@@ -155,6 +176,16 @@ class PlatformSessionTests(unittest.TestCase):
         courses = connector.discover_authorized_courses()
         self.assertEqual([item["course_id"] for item in courses], ["1"])
         self.assertEqual(courses[0]["authorization_state"], "verified")
+        self.assertTrue(any(path.endswith("get-my-course-month") for path, _ in calls))
+        self.assertFalse(any(path.endswith("get-course-list") for path, _ in calls))
+
+    def test_personal_catalog_deadline_fails_closed_before_any_request(self):
+        connector = object.__new__(PlatformSession)
+        connector._userinfo = {"id": "u", "account": "student", "tenant_id": "222"}
+        connector._course_json = Mock()
+        with self.assertRaisesRegex(PlatformSessionError, "platform_course_request_failed"):
+            connector._user_courses(deadline=0.1)
+        connector._course_json.assert_not_called()
     def test_redirect_target_is_closed_to_expected_https_hosts(self):
         expected = "https://icourse.fudan.edu.cn/a"
         self.assertEqual(_validate_url(expected), expected)

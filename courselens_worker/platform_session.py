@@ -11,13 +11,13 @@ import base64
 import hashlib
 import html as html_module
 import json
-import math
 import os
 import re
 import threading
 import time
 import uuid
 from binascii import hexlify
+from datetime import date
 from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlparse
 
@@ -163,6 +163,13 @@ def _is_login_target(value: str) -> bool:
 
 class PlatformSession:
     """Narrow session capable only of authorizing one requested lecture."""
+
+    CATALOG_TIMEOUT = (5, 15)
+    CATALOG_DEADLINE_SECONDS = 90
+    CATALOG_MAX_COURSES = 100
+    CATALOG_MONTHS_BACK = 12
+    CATALOG_MONTHS_AHEAD = 1
+    CATALOG_MAX_ROWS_PER_MONTH = 1000
 
     def __init__(self) -> None:
         self.session = curl_requests.Session(impersonate="chrome")
@@ -385,19 +392,25 @@ class PlatformSession:
                 return str(value or "")
         return ""
 
-    def _extract_course_bearer(self) -> str:
-        encoded = self._cookie_value(self.course_session, "_token")
+    def _extract_course_bearer(self, session: Any | None = None) -> str:
         pattern = re.compile(r'\{i:\d+;s:\d+:"_token";i:\d+;s:\d+:"(.+?)";\}')
-        for _ in range(3):
-            decoded = unquote(encoded)
-            match = pattern.search(decoded)
-            if match is not None:
-                token = match.group(1)
-                if 16 <= len(token) <= 4096 and "\r" not in token and "\n" not in token:
-                    return token
-            if decoded == encoded:
-                break
-            encoded = decoded
+        target = session or self.course_session
+        try:
+            values = [str(value or "") for _name, value in target.cookies.items()]
+        except (AttributeError, TypeError):
+            values = []
+        for value in values:
+            encoded = value
+            for _ in range(3):
+                decoded = unquote(encoded)
+                match = pattern.search(decoded)
+                if match is not None:
+                    token = match.group(1)
+                    if 16 <= len(token) <= 4096 and "\r" not in token and "\n" not in token:
+                        return token
+                if decoded == encoded:
+                    break
+                encoded = decoded
         raise _fail(
             "platform_session_rejected",
             connection_stage="course_ticket_follow_direct",
@@ -600,16 +613,32 @@ class PlatformSession:
             if response is not None:
                 response.close()
 
-    def _course_json(self, path: str, *, params: dict[str, Any]) -> dict[str, Any]:
+    def _course_json(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any],
+        authorization_required: bool = False,
+        timeout: tuple[float, float] | None = None,
+    ) -> dict[str, Any]:
+        request_timeout = timeout or (10, 60)
         if self._course_direct:
             response = self._direct_once(
                 "GET", ICOURSE_BASE + path, params=params,
                 headers={"Authorization": f"Bearer {self._course_bearer}"},
+                timeout=request_timeout,
                 connection_stage="course_request_direct",
             )
         else:
+            headers = None
+            if authorization_required:
+                headers = {
+                    "Authorization": f"Bearer {self._extract_course_bearer(self.session)}"
+                }
             response = self._once(
                 "GET", _vpn_url(ICOURSE_BASE + path), params=params,
+                headers=headers,
+                timeout=request_timeout,
                 connection_stage="course_request",
             )
         try:
@@ -619,9 +648,13 @@ class PlatformSession:
         finally:
             response.close()
 
-    def _userinfo_value(self) -> dict[str, Any]:
+    def _userinfo_value(
+        self, *, timeout: tuple[float, float] | None = None
+    ) -> dict[str, Any]:
         if self._userinfo is None:
-            data = self._course_json("/userapi/v1/infosimple", params={})
+            data = self._course_json(
+                "/userapi/v1/infosimple", params={}, timeout=timeout
+            )
             if data.get("code") not in (0, 200):
                 raise _fail("platform_course_request_failed")
             self._userinfo = dict(data.get("params") or data.get("data") or {})
@@ -647,10 +680,16 @@ class PlatformSession:
                         })
         return lectures
 
-    def course_detail(self, course_id: str) -> dict[str, Any]:
+    def course_detail(
+        self,
+        course_id: str,
+        *,
+        timeout: tuple[float, float] | None = None,
+    ) -> dict[str, Any]:
         data = self._course_json(
             "/courseapi/v3/multi-search/get-course-detail",
             params={"course_id": str(course_id)},
+            timeout=timeout,
         )
         if data.get("code") not in (0, 200):
             raise _fail("platform_course_request_failed")
@@ -662,57 +701,125 @@ class PlatformSession:
             "lectures": self._lecture_rows(raw),
         }
 
-    def _course_catalog_page(self, term: str, page: int, per_page: int) -> dict[str, Any]:
-        data = self._course_json(
-            "/portal/courseapi/v3/multi-search/get-course-list",
-            params={
-                "tenant": TENANT_CODE, "term": str(term),
-                "page": max(1, int(page)), "per_page": max(1, min(500, int(per_page))),
-            },
-        )
-        if data.get("code") not in (0, 200):
+    def _user_courses(
+        self, *, today: date | None = None, deadline: float | None = None
+    ) -> list[dict[str, Any]]:
+        end = deadline or (time.monotonic() + self.CATALOG_DEADLINE_SECONDS)
+        remaining = end - time.monotonic()
+        if remaining <= 0:
             raise _fail("platform_course_request_failed")
-        return dict(data.get("data") or {})
-
-    def discover_authorized_courses(self) -> list[dict[str, Any]]:
-        """Return only courses whose detail endpoint succeeds for this session."""
-        terms: list[tuple[str, str]] = []
-        for code in range(10, 36):
-            try:
-                data = self._course_catalog_page(str(code), 1, 1)
-            except PlatformSessionError:
-                continue
-            rows = list(data.get("list") or [])
-            if int(data.get("total") or 0) <= 0 or not rows:
-                continue
-            terms.append((str(code), str(rows[0].get("term_name") or code)))
-        output: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for term, term_name in sorted(terms, key=lambda item: int(item[0]), reverse=True):
-            first = self._course_catalog_page(term, 1, 500)
-            total = int(first.get("total") or 0)
-            pages = max(1, math.ceil(total / 500))
-            rows = list(first.get("list") or [])
-            for page in range(2, pages + 1):
-                rows.extend(list(self._course_catalog_page(term, page, 500).get("list") or []))
+        user = self._userinfo_value(
+            timeout=(self.CATALOG_TIMEOUT[0], min(self.CATALOG_TIMEOUT[1], remaining))
+        )
+        if not user.get("id") or not str(user.get("account") or "").strip() or not (
+            user.get("tenant_id") or TENANT_CODE
+        ):
+            raise _fail("platform_course_request_failed")
+        anchor = today or date.today()
+        month_index = anchor.year * 12 + anchor.month - 1
+        months = [
+            f"{value // 12:04d}-{value % 12 + 1:02d}"
+            for value in range(
+                month_index - self.CATALOG_MONTHS_BACK,
+                month_index + self.CATALOG_MONTHS_AHEAD + 1,
+            )
+        ]
+        courses: list[dict[str, Any]] = []
+        by_course: dict[str, dict[str, Any]] = {}
+        for month in months:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                raise _fail("platform_course_request_failed")
+            data = self._course_json(
+                "/courseapi/v2/course-live/get-my-course-month",
+                params={"month": month},
+                authorization_required=True,
+                timeout=(self.CATALOG_TIMEOUT[0], min(self.CATALOG_TIMEOUT[1], remaining)),
+            )
+            if data.get("code") not in (0, 200):
+                raise _fail("platform_course_request_failed")
+            days = data.get("list") or []
+            if not isinstance(days, list) or len(days) > 31:
+                raise _fail("platform_course_request_failed")
+            rows = [
+                row
+                for day_value in days
+                if isinstance(day_value, dict)
+                for row in day_value.get("course") or []
+                if isinstance(row, dict)
+            ]
+            if len(rows) > self.CATALOG_MAX_ROWS_PER_MONTH:
+                raise _fail("platform_course_request_failed")
             for raw in rows:
                 course_id = str(raw.get("id") or raw.get("course_id") or "").strip()
-                if not course_id or course_id in seen:
+                if not course_id:
                     continue
+                if course_id not in by_course:
+                    if len(courses) >= self.CATALOG_MAX_COURSES:
+                        raise _fail("platform_course_request_failed")
+                    candidate = {
+                        "course_id": course_id,
+                        "title": str(raw.get("title") or ""),
+                        "teacher": str(raw.get("realname") or raw.get("lecturer_name") or ""),
+                        "department": str(
+                            raw.get("kkxy_name") or raw.get("school_name")
+                            or raw.get("dept_name") or raw.get("kkxy") or ""
+                        ),
+                        "term": str(raw.get("term_name") or raw.get("term") or ""),
+                        "_lecture_durations": {},
+                    }
+                    by_course[course_id] = candidate
+                    courses.append(candidate)
+                sub_id = str(raw.get("sub_id") or "").strip()
                 try:
-                    detail = self.course_detail(course_id)
-                except PlatformSessionError:
-                    continue
-                seen.add(course_id)
-                detail.update({
-                    "term": term_name,
-                    "department": str(
-                        raw.get("kkxy_name") or raw.get("school_name")
-                        or raw.get("dept_name") or raw.get("kkxy") or ""
+                    duration = max(0.0, float(raw.get("sub_duration") or 0.0))
+                except (TypeError, ValueError):
+                    duration = 0.0
+                if sub_id and duration > 0:
+                    by_course[course_id]["_lecture_durations"][sub_id] = duration
+        return courses
+
+    def discover_authorized_courses(self) -> list[dict[str, Any]]:
+        """Verify courses from the identity-scoped personal schedule only."""
+        deadline = time.monotonic() + self.CATALOG_DEADLINE_SECONDS
+        candidates = self._user_courses(deadline=deadline)
+        output: list[dict[str, Any]] = []
+        failures = 0
+        for candidate in candidates:
+            course_id = str(candidate.get("course_id") or "")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _fail("platform_course_request_failed")
+            try:
+                detail = self.course_detail(
+                    course_id,
+                    timeout=(
+                        self.CATALOG_TIMEOUT[0],
+                        min(self.CATALOG_TIMEOUT[1], remaining),
                     ),
-                    "authorization_state": "verified",
-                })
-                output.append(detail)
+                )
+            except PlatformSessionError:
+                failures += 1
+                continue
+            durations = dict(candidate.get("_lecture_durations") or {})
+            detail["lectures"] = [
+                {
+                    **lecture,
+                    **(
+                        {"duration_seconds": durations[str(lecture.get("sub_id"))]}
+                        if str(lecture.get("sub_id")) in durations else {}
+                    ),
+                }
+                for lecture in detail.get("lectures") or []
+            ]
+            detail.update({
+                "term": str(candidate.get("term") or ""),
+                "department": str(candidate.get("department") or ""),
+                "authorization_state": "verified",
+            })
+            output.append(detail)
+        if candidates and not output and failures:
+            raise _fail("platform_course_request_failed")
         return output
 
     def _sign(self, media_url: str, now: int | None) -> str:
