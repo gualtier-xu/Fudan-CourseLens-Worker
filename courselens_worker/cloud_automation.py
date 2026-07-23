@@ -266,7 +266,7 @@ def verify() -> int:
     finally:
         api_key = ""
         if connector is not None:
-            connector.session.close()
+            connector.close()
 
 
 def _result_envelope(
@@ -504,7 +504,7 @@ def run_daily() -> int:
         (root / "state.box.json").write_bytes(_seal_state(state, key))
         api_key = ""
         if connector is not None:
-            connector.session.close()
+            connector.close()
         print(
             f"stage=complete code={code} discovered={counts['discovered']} "
             f"processed={counts['processed']} failed={counts['failed']} deferred={counts['deferred']} "

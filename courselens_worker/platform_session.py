@@ -19,7 +19,7 @@ import time
 import uuid
 from binascii import hexlify
 from typing import Any
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import requests
 from Crypto.Cipher import AES, PKCS1_v1_5
@@ -64,6 +64,14 @@ _CONNECTION_STAGES = frozenset({
     "course_ticket_follow",
     "course_verify",
     "course_request",
+    "course_context_direct",
+    "course_auth_methods_direct",
+    "course_key_direct",
+    "course_auth_execute_direct",
+    "course_ticket_direct",
+    "course_ticket_follow_direct",
+    "course_verify_direct",
+    "course_request_direct",
 })
 
 
@@ -159,10 +167,15 @@ class PlatformSession:
     def __init__(self) -> None:
         self.session = curl_requests.Session(impersonate="chrome")
         self.session.headers.update({"User-Agent": USER_AGENT})
+        self.course_session = curl_requests.Session(impersonate="chrome")
+        self.course_session.headers.update({"User-Agent": USER_AGENT})
         self._userinfo: dict[str, Any] | None = None
+        self._course_direct = False
+        self._course_bearer = ""
 
-    def _once(
-        self,
+    @staticmethod
+    def _request_once(
+        session: Any,
         method: str,
         url: str,
         *,
@@ -173,12 +186,18 @@ class PlatformSession:
         kwargs["allow_redirects"] = False
         kwargs.setdefault("timeout", (10, 60))
         try:
-            return self.session.request(method, target, **kwargs)
+            return session.request(method, target, **kwargs)
         except (requests.RequestException, CurlRequestException) as exc:
             raise _fail(
                 "platform_connection_failed",
                 connection_stage=connection_stage,
             ) from exc
+
+    def _once(self, method: str, url: str, **kwargs) -> requests.Response:
+        return self._request_once(self.session, method, url, **kwargs)
+
+    def _direct_once(self, method: str, url: str, **kwargs) -> requests.Response:
+        return self._request_once(self.course_session, method, url, **kwargs)
 
     def _follow(
         self,
@@ -186,13 +205,15 @@ class PlatformSession:
         url: str,
         *,
         connection_stage: str = "",
+        direct: bool = False,
         **kwargs,
     ) -> tuple[requests.Response, list[str]]:
         current = _validate_url(url)
         current_method = method.upper()
         trace = [current]
         for _ in range(_MAX_REDIRECTS + 1):
-            response = self._once(
+            request_once = self._direct_once if direct else self._once
+            response = request_once(
                 current_method,
                 current,
                 connection_stage=connection_stage,
@@ -218,7 +239,20 @@ class PlatformSession:
             raise _fail("platform_credentials_missing")
         try:
             self._login_webvpn(account, password)
-            self._login_course(account, password)
+            try:
+                self._login_course_direct(account, password)
+            except PlatformSessionError as exc:
+                if str(exc) not in {
+                    "platform_connection_failed",
+                    "platform_course_context_missing",
+                    "platform_ticket_missing",
+                    "platform_ticket_rejected",
+                    "platform_session_rejected",
+                }:
+                    raise
+                self._course_direct = False
+                self._course_bearer = ""
+                self._login_course(account, password)
         except PlatformSessionError:
             raise
         except Exception as exc:
@@ -340,6 +374,129 @@ class PlatformSession:
             if response is not None:
                 response.close()
 
+    @staticmethod
+    def _cookie_value(session: Any, name: str) -> str:
+        try:
+            items = session.cookies.items()
+        except (AttributeError, TypeError):
+            return ""
+        for key, value in items:
+            if str(key) == name:
+                return str(value or "")
+        return ""
+
+    def _extract_course_bearer(self) -> str:
+        encoded = self._cookie_value(self.course_session, "_token")
+        pattern = re.compile(r'\{i:\d+;s:\d+:"_token";i:\d+;s:\d+:"(.+?)";\}')
+        for _ in range(3):
+            decoded = unquote(encoded)
+            match = pattern.search(decoded)
+            if match is not None:
+                token = match.group(1)
+                if 16 <= len(token) <= 4096 and "\r" not in token and "\n" not in token:
+                    return token
+            if decoded == encoded:
+                break
+            encoded = decoded
+        raise _fail("platform_session_rejected")
+
+    def _login_course_direct(self, account: str, password: str) -> None:
+        cas = (
+            f"{ICOURSE_BASE}/casapi/index.php?r=auth/login&school_login=1"
+            f"&tenant_code={TENANT_CODE}&forward={quote(ICOURSE_BASE + '/', safe='')}"
+        )
+        response, trace = self._follow(
+            "GET", cas, connection_stage="course_context_direct", direct=True
+        )
+        lck = ""
+        try:
+            for candidate in trace + [response.url]:
+                match = re.search(r'lck=([^&#"\s]+)', str(candidate or ""))
+                if match:
+                    lck = match.group(1)
+                    break
+            if not lck:
+                match = re.search(r'lck=([^&#"\s]+)', response.text[:5000])
+                if match:
+                    lck = match.group(1)
+        finally:
+            response.close()
+        if not lck:
+            raise _fail("platform_course_context_missing")
+
+        method_data = _json(self._direct_once(
+            "POST", f"{IDP_BASE}/idp/authn/queryAuthMethods",
+            json={"lck": lck, "entityId": ICOURSE_BASE},
+            headers={"Content-Type": "application/json", "Referer": f"{IDP_BASE}/ac/", "Origin": IDP_BASE},
+            connection_stage="course_auth_methods_direct",
+        ), "platform_auth_method_missing")
+        chain, request_type = self._auth_method(method_data)
+        key_data = _json(self._direct_once(
+            "GET", f"{IDP_BASE}/idp/authn/getJsPublicKey",
+            headers={"Referer": f"{IDP_BASE}/ac/"},
+            connection_stage="course_key_direct",
+        ), "platform_key_rejected")
+        encrypted = self._encrypt_password(password, str(key_data.get("data") or ""))
+        auth_data = _json(self._direct_once(
+            "POST", f"{IDP_BASE}/idp/authn/authExecute",
+            json={
+                "authModuleCode": "userAndPwd", "authChainCode": chain,
+                "entityId": ICOURSE_BASE, "requestType": request_type, "lck": lck,
+                "authPara": {"loginName": account, "password": encrypted, "verifyCode": ""},
+            },
+            headers={"Content-Type": "application/json", "Referer": f"{IDP_BASE}/ac/", "Origin": IDP_BASE},
+            connection_stage="course_auth_execute_direct",
+        ), "platform_auth_failed")
+        if str(auth_data.get("code")) != "200" or not auth_data.get("loginToken"):
+            raise _fail("platform_auth_failed")
+        ticket_response = self._direct_once(
+            "POST", f"{IDP_BASE}/idp/authCenter/authnEngine",
+            data={"loginToken": str(auth_data["loginToken"])},
+            headers={"Referer": f"{IDP_BASE}/ac/", "Origin": IDP_BASE},
+            connection_stage="course_ticket_direct",
+        )
+        ticket = _ticket_from_html(ticket_response.text[:256 * 1024], "platform_ticket_missing")
+        ticket_response.close()
+        if urlparse(ticket).hostname != urlparse(ICOURSE_BASE).hostname:
+            raise _fail("platform_ticket_rejected")
+        try:
+            response, _ = self._follow(
+                "GET", ticket, stream=True, timeout=(5, 12),
+                connection_stage="course_ticket_follow_direct", direct=True,
+            )
+        except PlatformSessionError as exc:
+            if str(exc) != "platform_connection_failed":
+                raise
+        else:
+            try:
+                if not 200 <= response.status_code < 300 or _is_login_target(response.url):
+                    raise _fail("platform_ticket_rejected")
+            finally:
+                response.close()
+        self._course_bearer = self._extract_course_bearer()
+        if not self._verify_course_direct():
+            self._course_bearer = ""
+            raise _fail("platform_session_rejected")
+        self._course_direct = True
+
+    def _verify_course_direct(self) -> bool:
+        if not self._course_bearer:
+            return False
+        response = None
+        try:
+            response = self._direct_once(
+                "GET", f"{ICOURSE_BASE}/userapi/v1/infosimple",
+                headers={"Authorization": f"Bearer {self._course_bearer}"},
+                timeout=(3, 8), connection_stage="course_verify_direct",
+            )
+            data = _json(response, "platform_session_rejected")
+            return response.status_code == 200 and data.get("code") in (0, 200)
+        except PlatformSessionError:
+            return False
+        finally:
+            if response is not None:
+                response.close()
+
     def _login_course(self, account: str, password: str) -> None:
         cas = (
             f"{ICOURSE_BASE}/casapi/index.php?r=auth/login&school_login=1"
@@ -438,12 +595,17 @@ class PlatformSession:
                 response.close()
 
     def _course_json(self, path: str, *, params: dict[str, Any]) -> dict[str, Any]:
-        response = self._once(
-            "GET",
-            _vpn_url(ICOURSE_BASE + path),
-            params=params,
-            connection_stage="course_request",
-        )
+        if self._course_direct:
+            response = self._direct_once(
+                "GET", ICOURSE_BASE + path, params=params,
+                headers={"Authorization": f"Bearer {self._course_bearer}"},
+                connection_stage="course_request_direct",
+            )
+        else:
+            response = self._once(
+                "GET", _vpn_url(ICOURSE_BASE + path), params=params,
+                connection_stage="course_request",
+            )
         try:
             if response.status_code != 200:
                 raise _fail("platform_course_request_failed")
@@ -667,6 +829,14 @@ class PlatformSession:
             "Pragma": "no-cache",
         }
 
+    def close(self) -> None:
+        self._course_bearer = ""
+        self._userinfo = None
+        try:
+            self.course_session.close()
+        finally:
+            self.session.close()
+
 
 def materialize_job_sources(job: dict[str, Any]) -> dict[str, Any]:
     """Replace a sealed one-job request with runner-local HTTPS sources."""
@@ -687,7 +857,7 @@ def materialize_job_sources(job: dict[str, Any]) -> dict[str, Any]:
                 connector.login(account, password)
                 break
             except PlatformSessionError as exc:
-                connector.session.close()
+                connector.close()
                 connector = None
                 if str(exc) != "platform_connection_failed" or attempt == 2:
                     raise
@@ -704,7 +874,7 @@ def materialize_job_sources(job: dict[str, Any]) -> dict[str, Any]:
             payload["slides"] = connector.slide_sources(course_id, sub_id)
     finally:
         if connector is not None:
-            connector.session.close()
+            connector.close()
         account = ""
         password = ""
     job["payload"] = payload
@@ -727,7 +897,7 @@ def cloud_session_from_environment() -> PlatformSession:
                 connector.login(account, password)
                 return connector
             except PlatformSessionError as exc:
-                connector.session.close()
+                connector.close()
                 if str(exc) != "platform_connection_failed" or attempt == 2:
                     raise
                 time.sleep(1.5 * (attempt + 1))

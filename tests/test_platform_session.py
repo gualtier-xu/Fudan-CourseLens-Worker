@@ -27,6 +27,9 @@ class _FakeConnector:
     def __init__(self):
         self.session = self._Session()
 
+    def close(self):
+        self.session.close()
+
     def login(self, account, password):
         type(self).login_values = (account, password)
 
@@ -38,6 +41,60 @@ class _FakeConnector:
 
 
 class PlatformSessionTests(unittest.TestCase):
+    def test_login_prefers_direct_course_session_after_webvpn(self):
+        connector = object.__new__(PlatformSession)
+        connector._login_webvpn = Mock()
+        connector._login_course_direct = Mock()
+        connector._login_course = Mock()
+
+        connector.login("account", "password")
+
+        connector._login_webvpn.assert_called_once_with("account", "password")
+        connector._login_course_direct.assert_called_once_with("account", "password")
+        connector._login_course.assert_not_called()
+
+    def test_login_falls_back_only_for_direct_session_failures(self):
+        connector = object.__new__(PlatformSession)
+        connector._login_webvpn = Mock()
+        connector._login_course_direct = Mock(side_effect=PlatformSessionError(
+            "platform_connection_failed",
+            connection_stage="course_ticket_follow_direct",
+        ))
+        connector._login_course = Mock()
+        connector._course_direct = True
+        connector._course_bearer = "temporary"
+
+        connector.login("account", "password")
+
+        connector._login_course.assert_called_once_with("account", "password")
+        self.assertFalse(connector._course_direct)
+        self.assertEqual(connector._course_bearer, "")
+
+        connector._login_course_direct.side_effect = PlatformSessionError(
+            "platform_auth_failed"
+        )
+        connector._login_course.reset_mock()
+        with self.assertRaisesRegex(PlatformSessionError, "platform_auth_failed"):
+            connector.login("account", "password")
+        connector._login_course.assert_not_called()
+
+    def test_course_requests_use_the_isolated_direct_session(self):
+        connector = object.__new__(PlatformSession)
+        connector._course_direct = True
+        connector._course_bearer = "bounded-test-token"
+        response = Mock(status_code=200)
+        response.json.return_value = {"code": 0, "data": {}}
+        connector._direct_once = Mock(return_value=response)
+        connector._once = Mock()
+
+        result = connector._course_json("/userapi/v1/infosimple", params={})
+
+        self.assertEqual(result["code"], 0)
+        connector._once.assert_not_called()
+        request = connector._direct_once.call_args
+        self.assertEqual(request.args[:2], ("GET", "https://icourse.fudan.edu.cn/userapi/v1/infosimple"))
+        self.assertEqual(request.kwargs["headers"], {"Authorization": "Bearer bounded-test-token"})
+
     def test_authorized_catalog_requires_successful_detail_for_each_course(self):
         connector = object.__new__(PlatformSession)
         connector._userinfo = None
