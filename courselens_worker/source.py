@@ -350,10 +350,30 @@ class _PinnedRangeProxy(http.server.ThreadingHTTPServer):
             return self.resolved
         with self._refresh_lock:
             value = dict(self.refresh() or {})
+            refreshed_url = str(value.get("url") or "")
+            current = urlsplit(self.resolved.url)
+            refreshed = urlsplit(refreshed_url)
+            current_identity = (
+                current.scheme.casefold(),
+                str(current.hostname or "").casefold(),
+                current.port,
+                current.path,
+            )
+            refreshed_identity = (
+                refreshed.scheme.casefold(),
+                str(refreshed.hostname or "").casefold(),
+                refreshed.port,
+                refreshed.path,
+            )
+            if refreshed_identity != current_identity:
+                raise SourceSecurityError("source refresh changed the media identity")
             self.resolved = resolve_source_address(
-                str(value.get("url") or ""),
+                refreshed_url,
                 safe_headers(value.get("headers")),
-                public_ip_hint=str(value.get("resolved_public_ip") or ""),
+                # Keep every refresh on the public address validated when this
+                # loopback session started. This prevents DNS rebinding and
+                # avoids drifting between CDN edges mid-decode.
+                public_ip_hint=self.resolved.ip,
             )
             return self.resolved
 

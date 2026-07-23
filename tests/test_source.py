@@ -231,7 +231,7 @@ class SourceSecurityTests(unittest.TestCase):
             calls.append(len(calls) + 1)
             return {
                 "url": f"https://media.example.com/video?request={calls[-1]}",
-                "resolved_public_ip": "93.184.216.34",
+                "resolved_public_ip": f"93.184.216.{33 + calls[-1]}",
             }
 
         source = {**refresh(), "_refresh_source": refresh}
@@ -298,6 +298,26 @@ class SourceSecurityTests(unittest.TestCase):
                     self.assertEqual(response.read(), b"test")
         self.assertEqual(len(calls), 3)
         self.assertNotEqual(request.call_args_list[0].args[0], request.call_args_list[1].args[0])
+        self.assertEqual(request.call_args_list[0].args[2], request.call_args_list[1].args[2])
+
+    @patch("courselens_worker.source._request_once")
+    def test_loopback_proxy_rejects_refresh_to_another_media_identity(self, request):
+        request.return_value = (Mock(), FakeResponse(206, body=b"x"))
+        calls = []
+
+        def refresh():
+            calls.append(len(calls) + 1)
+            host = "media.example.com" if len(calls) < 3 else "other.example.com"
+            return {
+                "url": f"https://{host}/video?request={calls[-1]}",
+                "resolved_public_ip": "93.184.216.34",
+            }
+
+        source = {**refresh(), "_refresh_source": refresh}
+        with pinned_media_proxy(source) as proxy:
+            with self.assertRaisesRegex(SourceSecurityError, "media identity"):
+                proxy.refresh_source()
+        request.assert_not_called()
 
     @patch("courselens_worker.source._connect_pinned_upstream")
     def test_connect_proxy_pins_target_and_tunnels_without_inspecting_bytes(self, connect):
