@@ -176,11 +176,20 @@ class PlatformSession:
     CATALOG_MONTHS_AHEAD = 1
     CATALOG_MAX_ROWS_PER_MONTH = 1000
 
-    def __init__(self) -> None:
-        self.session = curl_requests.Session(impersonate="chrome")
+    def __init__(self, *, transport: str = "curl") -> None:
+        if transport not in {"curl", "requests"}:
+            raise ValueError("unsupported platform transport")
+        if transport == "curl":
+            self.session = curl_requests.Session(impersonate="chrome")
+            self.course_session = curl_requests.Session(impersonate="chrome")
+        else:
+            self.session = requests.Session()
+            self.course_session = requests.Session()
+            self.session.trust_env = False
+            self.course_session.trust_env = False
         self.session.headers.update({"User-Agent": USER_AGENT})
-        self.course_session = curl_requests.Session(impersonate="chrome")
         self.course_session.headers.update({"User-Agent": USER_AGENT})
+        self._transport = transport
         self._userinfo: dict[str, Any] | None = None
         self._course_direct = False
         self._course_bearer = ""
@@ -1081,8 +1090,8 @@ def cloud_session_from_environment() -> PlatformSession:
         password = ""
         raise _fail("platform_credentials_missing")
     try:
-        for attempt in range(3):
-            connector = PlatformSession()
+        for attempt, transport in enumerate(("curl", "requests", "requests")):
+            connector = PlatformSession(transport=transport)
             try:
                 connector.login(account, password, allow_webvpn_fallback=False)
                 return connector

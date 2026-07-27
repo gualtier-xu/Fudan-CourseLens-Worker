@@ -1,7 +1,7 @@
 {
   "algorithm": "ed25519",
   "key_id": "release-2026-01",
-  "payload_sha256": "9992e16b00b3d4a9a350379aada93eb6806766e03be00a35a381771ef82a7dd5",
+  "payload_sha256": "8e39951576da1dd039ba9f454827103c4ea6d780bb2ae9f92dceb27a159b084b",
   "schema": "courselens.worker-mirror.signature.v1",
-  "signature": "RF82SAzxbEVze3/dymmhVe3NhgfADkAA9/Osom3HhH+ZKJaDsFRgrHHd6Z2+T6H/8ClH1UQSGbP7WCy6R2bsDg=="
+  "signature": "PgVFL6Ti4P0zxwaOxVWCmTqPgFE5+/wXWGsngnMpdaP5QjEa0cmi95xGi1N/cQSY3OZ2UK9nt14p+sxJQuBkDA=="
 }

@@ -21,13 +21,15 @@ from courselens_worker.source import ResolvedSource, SourceSecurityError
 
 class _FakeConnector:
     login_values = None
+    transport_values = []
 
     class _Session:
         def close(self):
             return None
 
-    def __init__(self):
+    def __init__(self, *, transport="curl"):
         self.session = self._Session()
+        type(self).transport_values.append(transport)
 
     def close(self):
         self.session.close()
@@ -43,6 +45,18 @@ class _FakeConnector:
 
 
 class PlatformSessionTests(unittest.TestCase):
+    def test_requests_transport_disables_environment_proxies(self):
+        connector = PlatformSession(transport="requests")
+        try:
+            self.assertIsInstance(connector.session, requests.Session)
+            self.assertIsInstance(connector.course_session, requests.Session)
+            self.assertFalse(connector.session.trust_env)
+            self.assertFalse(connector.course_session.trust_env)
+        finally:
+            connector.close()
+        with self.assertRaisesRegex(ValueError, "unsupported platform transport"):
+            PlatformSession(transport="unknown")
+
     def test_source_headers_support_curl_cookie_mapping(self):
         connector = object.__new__(PlatformSession)
         connector.session = curl_requests.Session(impersonate="chrome")
@@ -126,6 +140,7 @@ class PlatformSessionTests(unittest.TestCase):
         class DirectOnlyConnector(_FakeConnector):
             attempts = 0
             fallback_values = []
+            transport_values = []
 
             def login(self, account, password, *, allow_webvpn_fallback=True):
                 type(self).attempts += 1
@@ -153,6 +168,9 @@ class PlatformSessionTests(unittest.TestCase):
         connector.close()
         self.assertEqual(DirectOnlyConnector.attempts, 3)
         self.assertEqual(DirectOnlyConnector.fallback_values, [False, False, False])
+        self.assertEqual(
+            DirectOnlyConnector.transport_values, ["curl", "requests", "requests"]
+        )
         self.assertEqual(sleep.call_count, 2)
 
     def test_course_requests_use_the_isolated_direct_session(self):
@@ -519,6 +537,7 @@ class PlatformSessionTests(unittest.TestCase):
     def test_cloud_login_rebuilds_transient_rejected_sessions(self):
         class FlakyConnector(_FakeConnector):
             attempts = 0
+            transport_values = []
 
             def login(self, account, password, *, allow_webvpn_fallback=True):
                 type(self).attempts += 1
@@ -542,6 +561,7 @@ class PlatformSessionTests(unittest.TestCase):
             connector = cloud_session_from_environment()
         connector.close()
         self.assertEqual(FlakyConnector.attempts, 3)
+        self.assertEqual(FlakyConnector.transport_values, ["curl", "requests", "requests"])
         self.assertEqual(sleep.call_count, 2)
 
     def test_connection_failure_retains_only_a_closed_set_stage(self):
