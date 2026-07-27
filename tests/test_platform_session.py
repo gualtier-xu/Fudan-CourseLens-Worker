@@ -136,7 +136,7 @@ class PlatformSessionTests(unittest.TestCase):
         connector._login_webvpn.assert_not_called()
         connector._login_course.assert_not_called()
 
-    def test_cloud_login_retries_direct_sessions_without_webvpn_fallback(self):
+    def test_cloud_login_allows_webvpn_fallback_only_on_final_attempt(self):
         class DirectOnlyConnector(_FakeConnector):
             attempts = 0
             fallback_values = []
@@ -167,7 +167,7 @@ class PlatformSessionTests(unittest.TestCase):
             connector = cloud_session_from_environment()
         connector.close()
         self.assertEqual(DirectOnlyConnector.attempts, 3)
-        self.assertEqual(DirectOnlyConnector.fallback_values, [False, False, False])
+        self.assertEqual(DirectOnlyConnector.fallback_values, [False, False, True])
         self.assertEqual(
             DirectOnlyConnector.transport_values, ["curl", "requests", "requests"]
         )

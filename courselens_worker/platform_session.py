@@ -1090,10 +1090,19 @@ def cloud_session_from_environment() -> PlatformSession:
         password = ""
         raise _fail("platform_credentials_missing")
     try:
-        for attempt, transport in enumerate(("curl", "requests", "requests")):
+        attempts = (
+            ("curl", False),
+            ("requests", False),
+            ("requests", True),
+        )
+        for attempt, (transport, allow_webvpn_fallback) in enumerate(attempts):
             connector = PlatformSession(transport=transport)
             try:
-                connector.login(account, password, allow_webvpn_fallback=False)
+                connector.login(
+                    account,
+                    password,
+                    allow_webvpn_fallback=allow_webvpn_fallback,
+                )
                 return connector
             except PlatformSessionError as exc:
                 connector.close()
