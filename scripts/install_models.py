@@ -7,7 +7,7 @@ import os
 import shutil
 import tarfile
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import requests
 
@@ -36,12 +36,35 @@ def _model_directories(root: Path, name: str) -> list[Path]:
 
 def _safe_extract(archive: Path, destination: Path) -> None:
     destination = destination.resolve()
+    destination.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:bz2") as handle:
+        members: list[tuple[tarfile.TarInfo, Path]] = []
         for member in handle.getmembers():
-            target = (destination / member.name).resolve()
+            relative = PurePosixPath(member.name)
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or member.issym()
+                or member.islnk()
+                or member.isdev()
+                or member.isfifo()
+                or not (member.isdir() or member.isfile())
+            ):
+                raise RuntimeError("model archive contains an unsafe member")
+            target = destination.joinpath(*relative.parts).resolve()
             if destination not in target.parents and target != destination:
                 raise RuntimeError("model archive contains an unsafe path")
-        handle.extractall(destination, filter="data")
+            members.append((member, target))
+        for member, target in members:
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = handle.extractfile(member)
+            if source is None:
+                raise RuntimeError("model archive member could not be read")
+            with source, target.open("wb") as output:
+                shutil.copyfileobj(source, output, length=1024 * 1024)
 
 
 def _install(name: str, spec: dict[str, str], root: Path) -> Path:

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
+import io
 import json
 import os
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,7 +21,42 @@ from courselens_worker.cloud_automation import (
 )
 
 
+_INSTALL_MODELS_PATH = (
+    Path(__file__).resolve().parents[1] / "scripts" / "install_models.py"
+)
+_INSTALL_MODELS_SPEC = importlib.util.spec_from_file_location(
+    "courselens_install_models", _INSTALL_MODELS_PATH
+)
+assert _INSTALL_MODELS_SPEC is not None and _INSTALL_MODELS_SPEC.loader is not None
+install_models = importlib.util.module_from_spec(_INSTALL_MODELS_SPEC)
+_INSTALL_MODELS_SPEC.loader.exec_module(install_models)
+
+
 class CloudAutomationTests(unittest.TestCase):
+    @staticmethod
+    def _model_archive(path: Path, member: tarfile.TarInfo, content: bytes = b"") -> None:
+        with tarfile.open(path, "w:bz2") as archive:
+            archive.addfile(member, io.BytesIO(content) if member.isfile() else None)
+
+    def test_model_extraction_is_python310_compatible_and_rejects_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "model.tar.bz2"
+            member = tarfile.TarInfo("model/tokens.txt")
+            member.size = 6
+            self._model_archive(archive, member, b"token\n")
+            destination = root / "models"
+            install_models._safe_extract(archive, destination)
+            self.assertEqual((destination / "model" / "tokens.txt").read_bytes(), b"token\n")
+
+            link_archive = root / "link.tar.bz2"
+            link = tarfile.TarInfo("model/link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../outside"
+            self._model_archive(link_archive, link)
+            with self.assertRaisesRegex(RuntimeError, "unsafe member"):
+                install_models._safe_extract(link_archive, destination)
+
     def test_state_is_encrypted_and_tamper_rejected(self):
         key = os.urandom(SecretBox.KEY_SIZE)
         state = _empty_state()
