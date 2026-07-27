@@ -72,6 +72,20 @@ class CloudAutomationTests(unittest.TestCase):
         self.assertNotIn("smtp", combined)
         self.assertNotIn("emailmessage", combined)
 
+    def test_cloud_workflows_use_the_macos_route_and_os_scoped_models(self):
+        root = Path(__file__).resolve().parents[1]
+        daily = (root / ".github" / "workflows" / "cloud-daily.yml").read_text(
+            encoding="utf-8"
+        )
+        verify = (root / ".github" / "workflows" / "cloud-verify.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("runs-on: macos-15", daily)
+        self.assertIn("runs-on: macos-15", verify)
+        self.assertIn("${{ runner.os }}-asr-models", daily)
+        self.assertIn("brew list ffmpeg", daily)
+        self.assertNotIn("apt-get", daily)
+
 
 if __name__ == "__main__":
     unittest.main()
