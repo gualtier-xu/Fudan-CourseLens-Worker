@@ -122,6 +122,39 @@ class PlatformSessionTests(unittest.TestCase):
         connector._login_webvpn.assert_not_called()
         connector._login_course.assert_not_called()
 
+    def test_cloud_login_retries_direct_sessions_without_webvpn_fallback(self):
+        class DirectOnlyConnector(_FakeConnector):
+            attempts = 0
+            fallback_values = []
+
+            def login(self, account, password, *, allow_webvpn_fallback=True):
+                type(self).attempts += 1
+                type(self).fallback_values.append(allow_webvpn_fallback)
+                if type(self).attempts < 3:
+                    raise PlatformSessionError(
+                        "platform_session_rejected",
+                        connection_stage="course_verify_direct",
+                    )
+                super().login(account, password)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "COURSELENS_CLOUD_STUDENT_ID": "student",
+                    "COURSELENS_CLOUD_PASSWORD": "password",
+                },
+                clear=True,
+            ),
+            patch("courselens_worker.platform_session.PlatformSession", DirectOnlyConnector),
+            patch("courselens_worker.platform_session.time.sleep") as sleep,
+        ):
+            connector = cloud_session_from_environment()
+        connector.close()
+        self.assertEqual(DirectOnlyConnector.attempts, 3)
+        self.assertEqual(DirectOnlyConnector.fallback_values, [False, False, False])
+        self.assertEqual(sleep.call_count, 2)
+
     def test_course_requests_use_the_isolated_direct_session(self):
         connector = object.__new__(PlatformSession)
         connector._course_direct = True
@@ -487,8 +520,9 @@ class PlatformSessionTests(unittest.TestCase):
         class FlakyConnector(_FakeConnector):
             attempts = 0
 
-            def login(self, account, password):
+            def login(self, account, password, *, allow_webvpn_fallback=True):
                 type(self).attempts += 1
+                self.assert_direct_only = not allow_webvpn_fallback
                 if type(self).attempts < 3:
                     raise PlatformSessionError("platform_session_rejected")
                 super().login(account, password)

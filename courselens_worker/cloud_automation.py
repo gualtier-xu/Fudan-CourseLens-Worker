@@ -464,11 +464,12 @@ def run_daily() -> int:
                     code = reason or "cloud_processing_failed"
         state["seen"] = seen
     except PlatformSessionError as exc:
-        code = str(exc) if str(exc) in {
+        base_code = str(exc)
+        code = safe_worker_error_detail(exc) if base_code in {
             "platform_auth_failed", "platform_ticket_rejected", "platform_session_rejected",
             "platform_connection_failed", "platform_course_request_failed",
         } else "platform_session_failed"
-        if code in {"platform_auth_failed", "platform_ticket_rejected", "platform_session_rejected"}:
+        if base_code in {"platform_auth_failed", "platform_ticket_rejected", "platform_session_rejected"}:
             auth = dict(circuits.get("authentication") or {})
             failures = int(auth.get("failures") or 0) + 1
             auth.update({

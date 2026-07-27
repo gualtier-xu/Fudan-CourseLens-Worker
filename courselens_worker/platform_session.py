@@ -246,7 +246,9 @@ class PlatformSession:
                 kwargs.pop("json", None)
         raise _fail("platform_redirect_rejected")
 
-    def login(self, account: str, password: str) -> None:
+    def login(
+        self, account: str, password: str, *, allow_webvpn_fallback: bool = True
+    ) -> None:
         if not account or not password:
             raise _fail("platform_credentials_missing")
         try:
@@ -261,6 +263,8 @@ class PlatformSession:
                     "platform_ticket_rejected",
                     "platform_session_rejected",
                 }:
+                    raise
+                if not allow_webvpn_fallback:
                     raise
                 self._course_direct = False
                 self._course_bearer = ""
@@ -1080,7 +1084,7 @@ def cloud_session_from_environment() -> PlatformSession:
         for attempt in range(3):
             connector = PlatformSession()
             try:
-                connector.login(account, password)
+                connector.login(account, password, allow_webvpn_fallback=False)
                 return connector
             except PlatformSessionError as exc:
                 connector.close()
