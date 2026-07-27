@@ -184,7 +184,7 @@ class PlatformSession:
         self._userinfo: dict[str, Any] | None = None
         self._course_direct = False
         self._course_bearer = ""
-
+        self._webvpn_ready = False
     @staticmethod
     def _request_once(
         session: Any,
@@ -250,9 +250,9 @@ class PlatformSession:
         if not account or not password:
             raise _fail("platform_credentials_missing")
         try:
-            self._login_webvpn(account, password)
             try:
                 self._login_course_direct(account, password)
+                return
             except PlatformSessionError as exc:
                 if str(exc) not in {
                     "platform_connection_failed",
@@ -264,7 +264,9 @@ class PlatformSession:
                     raise
                 self._course_direct = False
                 self._course_bearer = ""
-                self._login_course(account, password)
+            self._login_webvpn(account, password)
+            self._webvpn_ready = True
+            self._login_course(account, password)
         except PlatformSessionError:
             raise
         except Exception as exc:
@@ -916,6 +918,11 @@ class PlatformSession:
             }
 
         def fallback_source() -> dict[str, Any]:
+            if not self._webvpn_ready:
+                raise _fail(
+                    "platform_connection_failed",
+                    connection_stage="course_request",
+                )
             return {
                 "url": _vpn_url(issue_signed_url()),
                 "headers": self._source_headers(),
@@ -924,12 +931,16 @@ class PlatformSession:
         try:
             source = refresh_source()
         except SourceSecurityError:
+            if not self._webvpn_ready:
+                raise
             return {**fallback_source(), "_refresh_source": fallback_source}
-        return {
+        output = {
             **source,
             "_refresh_source": refresh_source,
-            "_fallback_source": fallback_source,
         }
+        if self._webvpn_ready:
+            output["_fallback_source"] = fallback_source
+        return output
 
     def slide_sources(self, course_id: str, sub_id: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -950,10 +961,22 @@ class PlatformSession:
                 image = str(content.get("pptimgurl") or "")
                 if not image:
                     continue
+                source = (
+                    {
+                        "url": _validate_upstream_url(image),
+                        "headers": {
+                            name: value
+                            for name, value in self._source_headers().items()
+                            if name.casefold() not in {"cookie", "origin", "referer"}
+                        },
+                    }
+                    if self._course_direct
+                    else {"url": _vpn_url(image), "headers": self._source_headers()}
+                )
                 items.append({
                     "page_num": len(items) + 1,
                     "created_sec": int(row.get("created_sec") or 0),
-                    "source": {"url": _vpn_url(image), "headers": self._source_headers()},
+                    "source": source,
                 })
             if len(rows) < 100:
                 break
@@ -988,6 +1011,7 @@ class PlatformSession:
     def close(self) -> None:
         self._course_bearer = ""
         self._userinfo = None
+        self._webvpn_ready = False
         try:
             self.course_session.close()
         finally:

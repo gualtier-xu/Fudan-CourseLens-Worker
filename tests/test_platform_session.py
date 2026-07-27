@@ -80,7 +80,7 @@ class PlatformSessionTests(unittest.TestCase):
         )
         self.assertEqual(safe_worker_error_detail(redacted), "platform_session_rejected")
 
-    def test_login_prefers_direct_course_session_after_webvpn(self):
+    def test_login_prefers_verified_direct_course_without_webvpn(self):
         connector = object.__new__(PlatformSession)
         connector._login_webvpn = Mock()
         connector._login_course_direct = Mock()
@@ -88,11 +88,11 @@ class PlatformSessionTests(unittest.TestCase):
 
         connector.login("account", "password")
 
-        connector._login_webvpn.assert_called_once_with("account", "password")
         connector._login_course_direct.assert_called_once_with("account", "password")
+        connector._login_webvpn.assert_not_called()
         connector._login_course.assert_not_called()
 
-    def test_login_falls_back_only_for_direct_session_failures(self):
+    def test_login_falls_back_to_webvpn_only_for_direct_session_failures(self):
         connector = object.__new__(PlatformSession)
         connector._login_webvpn = Mock()
         connector._login_course_direct = Mock(side_effect=PlatformSessionError(
@@ -102,19 +102,24 @@ class PlatformSessionTests(unittest.TestCase):
         connector._login_course = Mock()
         connector._course_direct = True
         connector._course_bearer = "temporary"
+        connector._webvpn_ready = False
 
         connector.login("account", "password")
 
+        connector._login_webvpn.assert_called_once_with("account", "password")
         connector._login_course.assert_called_once_with("account", "password")
         self.assertFalse(connector._course_direct)
+        self.assertTrue(connector._webvpn_ready)
         self.assertEqual(connector._course_bearer, "")
 
         connector._login_course_direct.side_effect = PlatformSessionError(
             "platform_auth_failed"
         )
         connector._login_course.reset_mock()
+        connector._login_webvpn.reset_mock()
         with self.assertRaisesRegex(PlatformSessionError, "platform_auth_failed"):
             connector.login("account", "password")
+        connector._login_webvpn.assert_not_called()
         connector._login_course.assert_not_called()
 
     def test_course_requests_use_the_isolated_direct_session(self):
@@ -259,6 +264,8 @@ class PlatformSessionTests(unittest.TestCase):
 
     def _media_connector(self):
         connector = object.__new__(PlatformSession)
+        connector._course_direct = True
+        connector._webvpn_ready = True
         connector._course_json = lambda *_args, **_kwargs: {
             "data": {
                 "now": 1,
@@ -299,6 +306,39 @@ class PlatformSessionTests(unittest.TestCase):
         self.assertEqual(parsed.hostname, "webvpn.fudan.edu.cn")
         self.assertIn("clientUUID=test", parsed.query)
         self.assertEqual(source["headers"]["Cookie"], "sealed")
+
+    def test_direct_media_does_not_offer_unverified_webvpn_fallback(self):
+        connector = self._media_connector()
+        connector._webvpn_ready = False
+        resolved = ResolvedSource(
+            "https://media.example.edu/lecture.mp4?clientUUID=test&t=test",
+            {"User-Agent": "CourseLens"},
+            "93.184.216.34",
+        )
+        with patch(
+            "courselens_worker.source.resolve_source_address", return_value=resolved
+        ):
+            source = connector.media_source("1", "2")
+        self.assertNotIn("_fallback_source", source)
+
+    def test_direct_slide_sources_do_not_require_webvpn_cookie(self):
+        connector = object.__new__(PlatformSession)
+        connector._course_direct = True
+        connector._webvpn_ready = False
+        connector._source_headers = lambda: {
+            "Cookie": "not-forwarded", "User-Agent": "CourseLens", "Accept": "*/*"
+        }
+        connector._course_json = Mock(side_effect=[{
+            "list": [{
+                "created_sec": 3,
+                "content": '{"pptimgurl":"https://media.example.edu/slide.jpg"}',
+            }]
+        }])
+
+        sources = connector.slide_sources("1", "2")
+
+        self.assertEqual(sources[0]["source"]["url"], "https://media.example.edu/slide.jpg")
+        self.assertNotIn("Cookie", sources[0]["source"]["headers"])
 
     def test_media_source_refreshes_the_signed_url_for_each_proxy_request(self):
         connector = self._media_connector()
