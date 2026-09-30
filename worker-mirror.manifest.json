@@ -1,6 +1,6 @@
 {
   "exporter": {
-    "allowlist_sha256": "5e245c7dbfb8885065bd44cb4356b3c65216f6d4d4ee29ac4eb2af77b5893e72",
+    "allowlist_sha256": "c7e3c3f07a2979e12cde1ce9ded6b30c90a18ca99f3a30d6761bb76a7c007c4c",
     "version": "1.0.0"
   },
   "payload": {
@@ -146,8 +146,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/llm.py",
-        "sha256": "8450584bdc3183d118169e4a64df58b6fc69d30a878e38c672f4384bded92d27",
-        "size": 73637
+        "sha256": "f2074e87824ffcb690664ad60368a2a15173ac3347219193c75d1177a84384d1",
+        "size": 82481
       },
       {
         "mode": "100644",
@@ -457,6 +457,12 @@
       },
       {
         "mode": "100644",
+        "path": "tests/test_summary_chain_hardening.py",
+        "sha256": "8c84b5e799f69be3cd56f225839f0bd9e9e33c33abac8ea8e59153ea0062e005",
+        "size": 14979
+      },
+      {
+        "mode": "100644",
         "path": "tests/test_summary_events.py",
         "sha256": "7060f311a03caf01ad0f4b36a4db0347e9aacffa40941b02265eaac618b04cad",
         "size": 6276
@@ -498,8 +504,8 @@
         "size": 10522
       }
     ],
-    "git_tree": "a74e5fa4bcbd8f2817866368f4570b6fe911a346",
-    "tree_sha256": "ec544761fd340c6915ed846474d9f50ab85748c6ee169b13aeff094742ee3f1d"
+    "git_tree": "df3a033c021e9f9f0637d8fc9b637de1fa54f7a2",
+    "tree_sha256": "6c0a5b62d8a1b30cc08a0d5e62c4cd55486cff5136a2e3ada467ef81c44416b6"
   },
   "protocol": {
     "supported_versions": [
@@ -508,8 +514,8 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "138b2ccc269d421a861d2d2c7fc6ff219882bf7f",
+    "commit": "044a0173a1343942f3b786b77f7408b62d1ab655",
     "repository": "Fudan-CourseLens-Private",
-    "worker_tree": "f9cd4eadeec1c92a3977be713825074cd54736b1"
+    "worker_tree": "e1ed927c26ebb17ab6284364b41ed218fdf783c3"
   }
 }

@@ -244,6 +244,52 @@ def _salvage_json_array(text: str) -> Any:
     raise LLMError("AI response is not valid JSON")
 
 
+def _salvage_summary_object(text: str) -> dict[str, Any] | None:
+    """Recover a summary window/merge object from a chatty or truncated reply.
+
+    SUMMARY-FIX-1 对象版抢救（术语链数组抢救的同族）：①整体花括号切片解析
+    （chatty 前后缀）；②截断响应按 markdown 键回收正文（提示词约定 markdown
+    在前、chapters 在后，输出帽截断吃掉的通常是尾部字段；chapters 缺席=合法
+    空表，后续锚定校验照走）。两级都空返回 None，由调用方计入重试。
+    """
+    value = str(text or "").strip()
+    if value.startswith("```"):
+        value = value.split("\n", 1)[-1].rsplit("```", 1)[0]
+    start = value.find("{")
+    end = value.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(value[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    match = re.search(r'"markdown"\s*:\s*"((?:[^"\\]|\\.)*)"', value)
+    if match:
+        try:
+            markdown = json.loads(f'"{match.group(1)}"')
+        except json.JSONDecodeError:
+            return None
+        if str(markdown).strip():
+            return {"markdown": str(markdown), "chapters": []}
+    return None
+
+
+def _valid_summary_part(part: Any) -> bool:
+    """SUMMARY-FIX-1：合法窗口/合并产物=对象+非空 markdown+chapters 列表。
+
+    FINALWRAP-C2 实锤形态：思考吞尽输出帽时模型可退化为合法 JSON 但
+    markdown 空串——旧形检只查类型不查空，空 markdown 一路放行成
+    completed 空笔记。空串在此按失败处理（走抢救/重试/降级）。
+    """
+    return (
+        isinstance(part, dict)
+        and isinstance(part.get("markdown"), str)
+        and bool(part["markdown"].strip())
+        and isinstance(part.get("chapters"), list)
+    )
+
+
 def _protected_forms(text: str) -> list[str]:
     return [match.group(0) for match in _PROTECTED_FORM_RE.finditer(text)]
 
@@ -1276,6 +1322,55 @@ def term_proofread_segments(
     return result
 
 
+# ---- SUMMARY-FIX-1：总结链思考档/输出帽/抢救重试（照搬术语链 v4 范式） ----
+# FINALWRAP-C2 实锤（2026-09-30 真实讲次两连败）：窗口/合并调用裸奔——不带
+# thinking=提供商默认 enabled/high，思考推理计入 max_tokens（窗口默认 8192、
+# 合并旧帽 12000），长输入+推理顶穿帽 → content 空/合法 JSON 但 markdown 空串
+# → completed+空笔记。缺省关思考（与 term v4-nonthink 同判：SUP3 实测思考档
+# 成本 1/16，本链 A/B 数字见结果文件），env 覆写闭集与 term 族同式。
+SUMMARY_THINKING_ENV = "COURSELENS_SUMMARY_THINKING"
+SUMMARY_THINKING: dict[str, str] | None = {"type": "disabled"}
+_SUMMARY_WINDOW_MAX_TOKENS = 8192             # 非思考档窗口帽（term v4 同款足够）
+_SUMMARY_WINDOW_THINKING_MAX_TOKENS = 16384   # 思考档窗口帽（推理计入输出帽）
+_SUMMARY_MERGE_MAX_TOKENS = 32_768            # 合并提额（旧 12000 → 32768）
+_SUMMARY_WINDOW_ATTEMPTS = 2                  # 窗口重试 1 次，再败降级跳过并计数
+_SUMMARY_MERGE_ATTEMPTS = 2                   # 合并重试 1 次，再败 fail-closed
+_SUMMARY_RETRY_BACKOFF_SECONDS = 1.0
+
+
+def _resolve_summary_thinking() -> dict[str, str] | None:
+    raw = os.environ.get(SUMMARY_THINKING_ENV, "").strip().lower()
+    if not raw:
+        return SUMMARY_THINKING
+    if raw in {"default", "provider-default"}:
+        return None
+    if raw == "disabled":
+        return {"type": "disabled"}
+    if raw in {"low", "high", "max"}:
+        return {"type": "enabled", "reasoning_effort": raw}
+    return SUMMARY_THINKING
+
+
+def aggregate_deep_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate drained per-call usage records into the deep_usage shape.
+
+    与 runner 术语段落账同键同语义（calls/tokens 拆分/缓存命中/总时延），
+    计数器零内容；总结链深账与窗口/合并重试计数共用本形。
+    """
+    return {
+        "calls": len(records),
+        "prompt_tokens": sum(int(item.get("prompt_tokens") or 0) for item in records),
+        "completion_tokens": sum(int(item.get("completion_tokens") or 0) for item in records),
+        "reasoning_tokens": sum(int(item.get("reasoning_tokens") or 0) for item in records),
+        "prompt_cache_hit_tokens": sum(
+            int(item.get("prompt_cache_hit_tokens") or 0) for item in records
+        ),
+        "latency_seconds": round(
+            sum(float(item.get("latency_ms") or 0) for item in records) / 1000, 1
+        ),
+    }
+
+
 _SUMMARY_MERGE_PROMPT = (
     "合并各窗口笔记为完整中文学习笔记，不得增加输入外事实。输出 JSON 对象，"
     "字段为 markdown 和 chapters；保留原有合法 start_ms，"
@@ -1329,6 +1424,7 @@ def create_summary(
     evidence_packet: dict[str, Any] | None = None,
     course_context: dict[str, Any] | None = None,
     glossary: tuple[str, ...] = (),
+    usage_sink: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """摘要/知识生成。
 
@@ -1336,12 +1432,31 @@ def create_summary(
     不传时与本函数历史上的行为逐位相同（窗口划分、提示词、输出键与数值都
     不变）。传了可用包时额外投喂文档页/题目窗口；传了术语表时字幕窗口与
     合并输入携带 glossary 数据（笔记术语写法保险）。
+    ``usage_sink``（SUMMARY-FIX-1）非 None 时收集本链每调用 usage 流水
+    （completion/reasoning 拆分，失败尝试也不丢账），供调用方落 outputs。
     """
     packet = evidence_packet if isinstance(evidence_packet, dict) else None
     if packet is not None and not packet.get("usable"):
         packet = None
     context = validate_course_context(course_context) if course_context is not None else {}
     terms = [str(term).strip() for term in (glossary or ()) if str(term).strip()][:200]
+    # SUMMARY-FIX-1：思考档显式决策（缺省 disabled，env 闭集覆写）；思考档
+    # 下窗口输出帽放大（推理计入 max_tokens）。
+    tier = _resolve_summary_thinking()
+    window_max_tokens = (
+        _SUMMARY_WINDOW_MAX_TOKENS
+        if (tier or {}).get("type") == "disabled"
+        else _SUMMARY_WINDOW_THINKING_MAX_TOKENS
+    )
+    usage_records: list[dict[str, Any]] = []
+    window_retries = 0
+    window_skipped = 0
+    merge_retries = 0
+
+    def _drain_usage() -> None:
+        # 每次窗口/合并调用（含失败尝试）后立即落账：HTTP 200 但 content 坏
+        # 的尝试也计了费，绝不让重试吃掉真实消耗。
+        usage_records.extend(drain_call_log())
 
     transcript_windows = [transcript[start:start + 120] for start in range(0, len(transcript), 120)]
     if not transcript_windows:
@@ -1385,6 +1500,7 @@ def create_summary(
         completed = min(completed, common)
 
     def summarize_window(index: int) -> dict[str, Any]:
+        nonlocal window_retries
         window = sources[index]
         if window.get("evidence"):
             window_prompt = _SUMMARY_EVIDENCE_WINDOW_PROMPT
@@ -1392,20 +1508,52 @@ def create_summary(
             window_prompt = _SUMMARY_WINDOW_PROMPT_WITH_GLOSSARY
         else:
             window_prompt = _SUMMARY_WINDOW_PROMPT
-        part = _json_content(_chat(api_key, [
+        messages = [
             {"role": "system", "content": window_prompt},
             {"role": "user", "content": json.dumps(window, ensure_ascii=False)},
-        ]))
-        if not isinstance(part, dict) or not isinstance(part.get("markdown"), str) or not isinstance(part.get("chapters"), list):
-            raise LLMError("summary window response has an invalid shape")
-        return part
+        ]
+        last_error: LLMError | None = None
+        for attempt in range(_SUMMARY_WINDOW_ATTEMPTS):
+            try:
+                raw = _chat(
+                    api_key, messages,
+                    max_tokens=window_max_tokens, thinking=tier,
+                )
+            finally:
+                _drain_usage()
+            part: Any = None
+            try:
+                part = _json_content(raw)
+            except LLMError:
+                part = _salvage_summary_object(raw)
+            if _valid_summary_part(part):
+                return part
+            last_error = LLMError("summary window response has an invalid shape")
+            if attempt + 1 < _SUMMARY_WINDOW_ATTEMPTS:
+                window_retries += 1
+                _emit_telemetry(f"stage=summary-window-retry attempt={attempt + 1}")
+                time.sleep(_SUMMARY_RETRY_BACKOFF_SECONDS)
+        raise last_error if last_error is not None else LLMError(
+            "summary window request failed"
+        )
 
     for batch_start in range(completed, len(sources), 2):
         indices = list(range(batch_start, min(len(sources), batch_start + 2)))
+        values: dict[int, dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=min(2, len(indices)), thread_name_prefix="llm-summary") as executor:
             futures = {index: executor.submit(summarize_window, index) for index in indices}
-            values = {index: futures[index].result() for index in indices}
+            for index in indices:
+                try:
+                    values[index] = futures[index].result()
+                except LLMError:
+                    # SUMMARY-FIX-1：单窗穷尽重试后降级跳过并计数（其余窗口照常，
+                    # 不再一窗失败拖垮整讲）；跳过的窗随检查点记 completed，
+                    # 绝不进 parts。
+                    window_skipped += 1
+                    _emit_telemetry(f"stage=summary-window-skip index={index}")
         for index in indices:
+            if index not in values:
+                continue
             parts.append(values[index])
             if checkpoint is not None:
                 checkpoint({
@@ -1417,6 +1565,13 @@ def create_summary(
                     "summary_evidence_windows": len(evidence_windows),
                     "summary_parts": parts,
                 })
+    if sources and not parts:
+        # 全部窗口被跳过（含重跑后仍全败）：fail-closed 抛出走 llm_pending，
+        # 绝不产出 completed 空笔记。
+        _emit_telemetry(
+            f"stage=summary windows_all_skipped={window_skipped}/{len(sources)}"
+        )
+        raise LLMError("summary windows all failed after retries")
 
     merge_input: dict[str, Any] = {"title": title, "parts": parts}
     if packet is not None:
@@ -1428,14 +1583,37 @@ def create_summary(
         # V4NONTHINK-1 件6：合并调用术语表走数据通道（merge 提示词顶在 ≤300
         # 防膨胀钉上不增字；窗口提示词已带「以 glossary 表为准」指令）。
         merge_input["glossary"] = terms
-    value = _json_content(_chat(api_key, [
+    # SUMMARY-FIX-1：合并调用显式思考档+提额帽；content 空/坏 JSON/空 markdown
+    # （C2 实锤形态）先抢救再重试 1 次，仍败 fail-closed 抛出。
+    merge_messages = [
         {"role": "system", "content": (
             _SUMMARY_MERGE_PROMPT_WITH_EVIDENCE if packet is not None else _SUMMARY_MERGE_PROMPT
         )},
         {"role": "user", "content": json.dumps(merge_input, ensure_ascii=False)},
-    ], max_tokens=12_000))
-    if not isinstance(value, dict) or not isinstance(value.get("markdown"), str) or not isinstance(value.get("chapters"), list):
-        raise LLMError("summary response has an invalid shape")
+    ]
+    value: dict[str, Any] | None = None
+    for attempt in range(_SUMMARY_MERGE_ATTEMPTS):
+        try:
+            raw = _chat(
+                api_key, merge_messages,
+                max_tokens=_SUMMARY_MERGE_MAX_TOKENS, thinking=tier,
+            )
+        finally:
+            _drain_usage()
+        candidate: Any = None
+        try:
+            candidate = _json_content(raw)
+        except LLMError:
+            candidate = _salvage_summary_object(raw)
+        if _valid_summary_part(candidate):
+            value = candidate
+            break
+        if attempt + 1 < _SUMMARY_MERGE_ATTEMPTS:
+            merge_retries += 1
+            _emit_telemetry(f"stage=summary-merge-retry attempt={attempt + 1}")
+            time.sleep(_SUMMARY_RETRY_BACKOFF_SECONDS)
+    if not _valid_summary_part(value):
+        raise LLMError("summary merge response has an invalid shape")
     valid_anchors = {int(item.get("start_ms") or 0) for item in transcript}
     valid_anchors.update(int(item.get("created_sec") or 0) * 1000 for item in ppt_pages)
     chapters = []
@@ -1497,13 +1675,28 @@ def create_summary(
         value.get("topic_candidates") if packet is not None else None
     )
     # 夜10-C 可观测性：摘要链收口遥测（与校对链同纪律：计数与闭集词，
-    # 零提示词、零响应文本、零字幕/笔记内容）。
+    # 零提示词、零响应文本、零字幕/笔记内容）。SUMMARY-FIX-1 追加思考档/
+    # 重试/降级/深账计数（同为闭集计数词）。
+    deep_usage = {
+        **aggregate_deep_usage(usage_records),
+        "thinking": _term_tier_tag(tier),
+        "window_retries": window_retries,
+        "window_skipped": window_skipped,
+        "merge_retries": merge_retries,
+    }
+    if usage_sink is not None:
+        usage_sink.extend(usage_records)
     _emit_telemetry(
         f"stage=summary windows={len(sources)}/{len(sources)} "
         f"resumed={completed} evidence_windows={len(evidence_windows)} "
         f"events={len(events)} events_rejected={rejected} "
         f"takeaways={len(takeaways)} knowledge_points={len(knowledge_points)} "
-        f"citations_rejected={int(point_meta.get('rejected') or 0)}"
+        f"citations_rejected={int(point_meta.get('rejected') or 0)} "
+        f"thinking={deep_usage['thinking']} window_retries={window_retries} "
+        f"window_skipped={window_skipped} merge_retries={merge_retries} "
+        f"llm_calls={deep_usage['calls']} "
+        f"completion_tokens={deep_usage['completion_tokens']} "
+        f"reasoning_tokens={deep_usage['reasoning_tokens']}"
     )
     return {
         "model": MODEL,
@@ -1520,6 +1713,9 @@ def create_summary(
         ),
         "citations_rejected": int(point_meta.get("rejected") or 0),
         "citations_rejected_reasons": dict(point_meta.get("reasons") or {}),
+        # SUMMARY-FIX-1：总结链 LLM 深账（随 outputs["summary"] 落地，与字幕
+        # outputs["subtitle"]["deep_usage"] 同形对称；计数器零内容）。
+        "deep_usage": deep_usage,
     }
 
 
