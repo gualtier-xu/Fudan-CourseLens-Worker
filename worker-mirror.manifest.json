@@ -508,7 +508,7 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "c0cfe4be8be0e73c421cf26e195ba4824ae25aff",
+    "commit": "138b2ccc269d421a861d2d2c7fc6ff219882bf7f",
     "repository": "Fudan-CourseLens-Private",
     "worker_tree": "f9cd4eadeec1c92a3977be713825074cd54736b1"
   }
