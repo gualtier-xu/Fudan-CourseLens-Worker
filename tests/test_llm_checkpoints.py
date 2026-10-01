@@ -1,8 +1,15 @@
 import json
+import os
 import unittest
 from unittest.mock import patch
 
-from courselens_worker.llm import PROOFREAD_PAIRING, answer_question, create_summary, proofread_segments
+from courselens_worker.llm import (
+    PROOFREAD_PAIRING,
+    REVIEW_VIEWS_ENV,
+    answer_question,
+    create_summary,
+    proofread_segments,
+)
 
 
 class LLMCheckpointTests(unittest.TestCase):
@@ -129,10 +136,12 @@ class LLMCheckpointTests(unittest.TestCase):
             "chapters": [{"title": "chapter", "start_ms": 120000, "summary": "summary"}],
         }
         checkpoints = []
+        # 本钉面=窗口/合并 resume 语义（视图派生属 test_review_views.py），
+        # 关掉派生调用保持既有调用数语义。
         with patch(
             "courselens_worker.llm._chat",
             side_effect=[json.dumps(second_part), json.dumps(final)],
-        ) as chat:
+        ) as chat, patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             result = create_summary(
                 "secret",
                 title="title",
@@ -167,10 +176,13 @@ class LLMCheckpointTests(unittest.TestCase):
                  "text": "second version page", "page": 1},
             ],
         }
-        with patch(
-            "courselens_worker.llm._chat",
-            side_effect=[json.dumps(second_part), json.dumps(final)],
-        ) as chat:
+        with (
+            patch(
+                "courselens_worker.llm._chat",
+                side_effect=[json.dumps(second_part), json.dumps(final)],
+            ) as chat,
+            patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}),
+        ):
             result = create_summary(
                 "secret",
                 title="t",

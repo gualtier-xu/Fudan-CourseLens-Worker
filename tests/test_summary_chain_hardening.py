@@ -19,6 +19,7 @@ from courselens_worker.llm import (
     _SUMMARY_WINDOW_MAX_TOKENS,
     _SUMMARY_WINDOW_PROMPT,
     _SUMMARY_MERGE_PROMPT,
+    REVIEW_VIEWS_ENV,
     SUMMARY_THINKING,
     SUMMARY_THINKING_ENV,
     _resolve_summary_thinking,
@@ -74,7 +75,7 @@ class ThinkingTierTests(unittest.TestCase):
                 return json.dumps({"markdown": "combined", "chapters": []})
             return json.dumps(_part("part"))
 
-        with patch.dict(os.environ, {SUMMARY_THINKING_ENV: ""}, clear=False):
+        with patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False):
             with patch("courselens_worker.llm._chat", side_effect=fake_chat):
                 create_summary("k", title="t", transcript=_transcript(130), ppt_pages=[])
         self.assertEqual(len(captured), 3)
@@ -97,7 +98,7 @@ class ThinkingTierTests(unittest.TestCase):
                 return json.dumps(_part("part"))
             return json.dumps({"markdown": "combined", "chapters": []})
 
-        with patch.dict(os.environ, {SUMMARY_THINKING_ENV: "high"}, clear=False):
+        with patch.dict(os.environ, {SUMMARY_THINKING_ENV: "high", REVIEW_VIEWS_ENV: "off"}, clear=False):
             with patch("courselens_worker.llm._chat", side_effect=fake_chat):
                 create_summary("k", title="t", transcript=_transcript(10), ppt_pages=[])
         self.assertTrue(all(cap == 16384 for cap in captured), captured)
@@ -181,7 +182,7 @@ class WindowRetryTests(unittest.TestCase):
         )
         lines: list[str] = []
         with (
-            patch.dict(os.environ, {SUMMARY_THINKING_ENV: ""}, clear=False),
+            patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False),
             patch("courselens_worker.llm._chat", side_effect=fake),
             patch("courselens_worker.llm._emit_telemetry", side_effect=lines.append),
         ):
@@ -224,7 +225,7 @@ class MergeRetryTests(unittest.TestCase):
             calls["n"] += 1
             return response
 
-        with patch.dict(os.environ, {SUMMARY_THINKING_ENV: ""}, clear=False):
+        with patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False):
             with patch("courselens_worker.llm._chat", side_effect=fake_chat) as chat:
                 result = create_summary("k", title="t", transcript=_transcript(10), ppt_pages=[])
         return result, chat
@@ -273,7 +274,7 @@ class UsageSinkTests(unittest.TestCase):
             return json.dumps(_part("part"))
 
         sink: list[dict] = []
-        with patch.dict(os.environ, {SUMMARY_THINKING_ENV: ""}, clear=False):
+        with patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False):
             with patch("courselens_worker.llm._chat", side_effect=fake_chat):
                 result = create_summary(
                     "k", title="t", transcript=_transcript(10), ppt_pages=[],
@@ -306,7 +307,7 @@ class UsageSinkTests(unittest.TestCase):
             return json.dumps(_part("part"))
 
         with (
-            patch.dict(os.environ, {SUMMARY_THINKING_ENV: ""}, clear=False),
+            patch.dict(os.environ, {SUMMARY_THINKING_ENV: "", REVIEW_VIEWS_ENV: "off"}, clear=False),
             patch("courselens_worker.llm._chat", side_effect=fake_chat),
             patch("courselens_worker.llm._emit_telemetry", side_effect=lines.append),
         ):

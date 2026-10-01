@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +31,7 @@ from courselens_worker.llm import (
     _SUMMARY_EVIDENCE_WINDOW_PROMPT,
     _SUMMARY_MERGE_PROMPT,
     _SUMMARY_MERGE_PROMPT_WITH_EVIDENCE,
+    REVIEW_VIEWS_ENV,
     create_summary,
 )
 
@@ -423,7 +425,9 @@ class SummaryEvidenceTests(unittest.TestCase):
             payloads.append(messages)
             return json.dumps({"markdown": "笔记", "chapters": []})
 
-        with patch("courselens_worker.llm._chat", side_effect=fake_chat):
+        # 本钉面在视图派生之前的历史链形状（视图派生钉在 test_review_views.py）。
+        with patch("courselens_worker.llm._chat", side_effect=fake_chat), \
+                patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             value = create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES)
         self.assertEqual(payloads[0][0]["content"],
                          "你是严谨的课程学习助理。仅依据输入整理当前窗口，输出 JSON 对象，"
@@ -444,7 +448,8 @@ class SummaryEvidenceTests(unittest.TestCase):
             payloads.append(messages)
             return json.dumps({"markdown": "笔记", "chapters": []})
 
-        with patch("courselens_worker.llm._chat", side_effect=fake_chat):
+        with patch("courselens_worker.llm._chat", side_effect=fake_chat), \
+                patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES,
                            evidence_packet=packet)
         # 字幕窗个数随分段数变化，按内容定位证据窗（正文只在文档窗里投喂一次）。
@@ -511,7 +516,8 @@ class SummaryEvidenceTests(unittest.TestCase):
             payloads.append(messages)
             return json.dumps({"markdown": "笔记", "chapters": []})
 
-        with patch("courselens_worker.llm._chat", side_effect=fake_chat):
+        with patch("courselens_worker.llm._chat", side_effect=fake_chat), \
+                patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             value = create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES,
                                    evidence_packet=normalize({"contract": "other"}))
         self.assertEqual(payloads[-1][0]["content"], _SUMMARY_MERGE_PROMPT)
@@ -530,7 +536,8 @@ class SummaryCheckpointTests(unittest.TestCase):
             calls["count"] += 1
             return json.dumps({"markdown": "笔记", "chapters": []})
 
-        with patch("courselens_worker.llm._chat", side_effect=fake_chat):
+        with patch("courselens_worker.llm._chat", side_effect=fake_chat), \
+                patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES,
                            evidence_packet=packet)
         first_window_calls = calls["count"] - 1
@@ -546,7 +553,8 @@ class SummaryCheckpointTests(unittest.TestCase):
                            evidence_packet=packet)
         # 全量跑一遍拿到计划
         with patch("courselens_worker.llm._chat",
-                   return_value=json.dumps({"markdown": "笔记", "chapters": []})):
+                   return_value=json.dumps({"markdown": "笔记", "chapters": []})), \
+                patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES,
                            evidence_packet=packet, checkpoint=capture)
         self.assertIsInstance(prior_plan["summary_window_plan"], list)
@@ -557,7 +565,8 @@ class SummaryCheckpointTests(unittest.TestCase):
                               if entry.startswith("evidence:")]))
         # 计划未变 → 只跑合并调用
         before = calls["count"]
-        with patch("courselens_worker.llm._chat", side_effect=fake_chat):
+        with patch("courselens_worker.llm._chat", side_effect=fake_chat), \
+                patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES,
                            evidence_packet=packet,
                            prior_checkpoint={
@@ -584,7 +593,8 @@ class SummaryCheckpointTests(unittest.TestCase):
 
         # 换成"仍有文档窗但内容变了"的包：文档窗重跑，字幕窗计数保留。
         other = normalize(all_packets()["conflicting_sources"])
-        with patch("courselens_worker.llm._chat", side_effect=fake_chat):
+        with patch("courselens_worker.llm._chat", side_effect=fake_chat), \
+                patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES,
                            evidence_packet=other,
                            prior_checkpoint={
@@ -923,7 +933,8 @@ class EndToEndSummaryTests(unittest.TestCase):
         completed = checkpoints[-1]["summary_completed_windows"]
         self.assertTrue(any(entry.startswith("evidence:") for entry in plan))
         calls["count"] = 0
-        with patch("courselens_worker.llm._chat", side_effect=counting_chat):
+        with patch("courselens_worker.llm._chat", side_effect=counting_chat), \
+                patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             create_summary("key", title="t", transcript=TRANSCRIPT, ppt_pages=PPT_PAGES,
                            evidence_packet=packet,
                            prior_checkpoint={
@@ -954,7 +965,8 @@ class LegacyPayloadCompatibilityTests(unittest.TestCase):
             return json.dumps({"markdown": "笔记", "chapters": [], "key_takeaways": ["甲"],
                                "assessment_events": []})
 
-        with patch("courselens_worker.llm._chat", side_effect=fake_chat):
+        with patch("courselens_worker.llm._chat", side_effect=fake_chat), \
+                patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             result = _process_materialized_job(self._job({
                 "title": "t", "transcript": TRANSCRIPT, "slides": []}))
         summary = result["outputs"]["summary"]

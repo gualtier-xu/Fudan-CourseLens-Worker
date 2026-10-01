@@ -101,6 +101,19 @@ git diff --check
 
 模型安装和合成冒烟测试由 `scripts/install_models.py`、`synthetic_asr_smoke.py` 和 `synthetic_ocr_smoke.py` 提供。不得用真实课程内容替代 CI 合成数据。
 
+### 在 CourseLens 主开发仓开发时的测试环境家规
+
+在主开发仓的 `worker/` 子目录开发时，worker 全量与定向测试一律使用独立的 `.venv-worker` 环境（`tools/python310` 同源 Python 3.10），与客户端正典 venv 严格隔离。客户端 venv 缺少 worker 重依赖，直接拿它跑 worker 全量会产生成批环境假失败（2026-10-02 实测 23 例，逐项归因为环境缺口后全部消除，无一为真实缺陷）。包收口全量口径：
+
+```bash
+tools/python310/python.exe -m venv .venv-worker
+.venv-worker/Scripts/python.exe -m pip install -r worker/requirements.txt tzdata
+cd worker
+PYTHONPATH=<monorepo 根> ../.venv-worker/Scripts/python.exe -m unittest discover -s tests -p "test_*.py" -q
+```
+
+正典 harness 是 unittest discover（与 CI 同款）；pytest 仅用于基线对照，需要时另装 `pytest==9.0.3` 以同口径复跑。2026-10-02 真实基线：unittest 645 tests OK、pytest 661 passed（均 0 失败 0 跳过；tzdata 为 Windows 本地真跑必需）。`scripts/check_public_boundary.py` 只在镜像仓上下文运行，主开发仓的 `worker/` 子目录内不跑（monorepo 侧等价守门是镜像策略检查）。
+
 ## 发布顺序
 
 1. 从最新 `main` 创建分支，通过 Pull Request、CI、协议测试、UTF-8、链接和公共边界扫描。

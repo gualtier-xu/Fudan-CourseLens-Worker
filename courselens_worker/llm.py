@@ -1453,6 +1453,335 @@ def _takeaway_anchor_ms(text: str, candidates: list[tuple[int, str]]) -> int | N
     return best_ms
 
 
+# ---- P2-CONTRACT-1 §①②：多视图复习包派生（LLM 一次四档；视图是增量不是门槛） ----
+# RR-P2MULTI-1 零 LLM 三视图的派生增量：收口在 create_summary 内部（merge 校验
+# 收口后、return 前），runner/客户端领回三路自动同权，不新增任何调用点。独立
+# 调用、独立提示词——merge/window 提示词逐位不动（299/300 防膨胀钉纪律）。
+# 开关闭集 {缺省, "off"}：缺省开；off=零调用零开销。任何失败 fail-open：
+# summary 照常落地，无 review_views 键 → 不落 artifact → 前端零 LLM 版照常。
+REVIEW_VIEWS_ENV = "COURSELENS_REVIEW_VIEWS"
+_REVIEW_VIEWS_MAX_TOKENS = 8192
+_REVIEW_VIEWS_ATTEMPTS = 2
+_REVIEW_VIEWS_RETRY_BACKOFF_SECONDS = _SUMMARY_RETRY_BACKOFF_SECONDS
+# 与客户端入库帽同法（learning_store: str(markdown)[:5000]），输入侧同一截断。
+_REVIEW_VIEWS_MARKDOWN_CAP = 5000
+_REVIEW_VIEWS_PROMPT = (
+    "复习资料编辑。只改写输入，不新增；材料没有的不编。"
+    "输出JSON：study_guide.items≤12（question/hint/anchor_ms/citation_ids）；"
+    "faq.items≤8（question/answer/anchor_ms/citation_ids）；"
+    "timeline.events≤24升序（start_ms/title/detail）；"
+    "briefing（speed_read/must_know≤6/exam_alerts≤6改写自assessment_events）。"
+    "锚取anchor_pool；citation_ids取evidence_index。"
+)
+
+
+def _review_views_enabled() -> bool:
+    return os.environ.get(REVIEW_VIEWS_ENV, "").strip().lower() != "off"
+
+
+def _extract_balanced_object(text: str, key: str) -> dict[str, Any] | None:
+    """String-aware brace scan of the complete object bound to ``key``."""
+    marker = f'"{key}"'
+    key_index = text.find(marker)
+    if key_index < 0:
+        return None
+    opening = text.find("{", key_index + len(marker))
+    if opening < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(opening, len(text)):
+        character = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    parsed = json.loads(text[opening:index + 1])
+                except json.JSONDecodeError:
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _salvage_views_object(text: str) -> dict[str, Any] | None:
+    """Recover a four-tier views object from a chatty or truncated reply.
+
+    _salvage_summary_object 同族：①整体花括号切片解析（chatty 前后缀）；
+    ②截断响应按四档键逐个回收已完成对象（字符串感知括号配平扫描；输出帽
+    截断通常吃掉尾部 briefing，已完成的头部档各自有效，坏档进不了正文）。
+    两级都空返回 None，由调用方计入重试。
+    """
+    value = str(text or "").strip()
+    if value.startswith("```"):
+        value = value.split("\n", 1)[-1].rsplit("```", 1)[0]
+    start = value.find("{")
+    end = value.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(value[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    recovered: dict[str, Any] = {}
+    for key in ("study_guide", "faq", "timeline", "briefing"):
+        piece = _extract_balanced_object(value, key)
+        if piece is not None:
+            recovered[key] = piece
+    return recovered or None
+
+
+def _validate_review_views(
+    candidate: Any,
+    *,
+    anchor_pool: set[int],
+    allowed_citations: set[str],
+    assessment_events: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, int, int]:
+    """P2 合同 §① 校验纪律（既有家规的确定性复用，宁缺勿假）。
+
+    ①文本帽=takeaways 同法截断+空串丢条；②锚白名单：study_guide/faq 非法
+    锚置 null（保持可读不可点），timeline 白名单外整条丢弃（错锚比缺锚更
+    伤信任）并计 anchor_rejected；③引用闭集：非法 id 丢弃、条目保留（诚实
+    降级）并计 citation_rejected，无 evidence_index 强制空；④exam_alerts
+    只改写不新造：category 闭集 + 逐条对应未消费事件（Dice≥锚家规阈值）；
+    ⑤未知字段忽略；⑥数量帽超出截断。四档全缺返回 None（省键不落空档）。
+    """
+    if not isinstance(candidate, dict):
+        return None, 0, 0
+    anchor_rejected = 0
+    citation_rejected = 0
+    views: dict[str, Any] = {}
+
+    def anchor_or_none(raw: Any) -> int | None:
+        nonlocal anchor_rejected
+        if raw is None:
+            return None
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            anchor_rejected += 1
+            return None
+        value = int(raw)
+        if value in anchor_pool:
+            return value
+        anchor_rejected += 1
+        return None
+
+    def citations_of(raw: Any) -> list[str]:
+        nonlocal citation_rejected
+        if not isinstance(raw, list):
+            return []
+        kept: list[str] = []
+        for item in raw:
+            citation_id = str(item or "").strip()
+            if not citation_id:
+                continue
+            if citation_id in allowed_citations:
+                kept.append(citation_id)
+            else:
+                citation_rejected += 1
+        return kept
+
+    guide = candidate.get("study_guide")
+    if isinstance(guide, dict) and isinstance(guide.get("items"), list):
+        items: list[dict[str, Any]] = []
+        for raw_item in guide["items"][:12]:
+            if not isinstance(raw_item, dict):
+                continue
+            question = str(raw_item.get("question") or "").strip()[:80]
+            if not question:
+                continue
+            items.append({
+                "question": question,
+                "hint": str(raw_item.get("hint") or "").strip()[:60],
+                "anchor_ms": anchor_or_none(raw_item.get("anchor_ms")),
+                "citation_ids": citations_of(raw_item.get("citation_ids")),
+            })
+        if items:
+            views["study_guide"] = {"items": items}
+
+    faq = candidate.get("faq")
+    if isinstance(faq, dict) and isinstance(faq.get("items"), list):
+        items = []
+        for raw_item in faq["items"][:8]:
+            if not isinstance(raw_item, dict):
+                continue
+            question = str(raw_item.get("question") or "").strip()[:80]
+            answer = str(raw_item.get("answer") or "").strip()[:200]
+            if not question or not answer:
+                continue
+            items.append({
+                "question": question,
+                "answer": answer,
+                "anchor_ms": anchor_or_none(raw_item.get("anchor_ms")),
+                "citation_ids": citations_of(raw_item.get("citation_ids")),
+            })
+        if items:
+            views["faq"] = {"items": items}
+
+    timeline = candidate.get("timeline")
+    if isinstance(timeline, dict) and isinstance(timeline.get("events"), list):
+        timeline_events: list[dict[str, Any]] = []
+        for raw_item in timeline["events"][:24]:
+            if not isinstance(raw_item, dict):
+                continue
+            start_ms = raw_item.get("start_ms")
+            if (
+                isinstance(start_ms, bool)
+                or not isinstance(start_ms, (int, float))
+                or int(start_ms) not in anchor_pool
+            ):
+                anchor_rejected += 1
+                continue
+            title = str(raw_item.get("title") or "").strip()[:30]
+            if not title:
+                continue
+            timeline_events.append({
+                "start_ms": int(start_ms),
+                "title": title,
+                "detail": str(raw_item.get("detail") or "").strip()[:120],
+            })
+        if timeline_events:
+            timeline_events.sort(key=lambda item: item["start_ms"])
+            views["timeline"] = {"events": timeline_events}
+
+    briefing = candidate.get("briefing")
+    if isinstance(briefing, dict):
+        speed_read = str(briefing.get("speed_read") or "").strip()[:600]
+        if speed_read:
+            must_know: list[str] = []
+            if isinstance(briefing.get("must_know"), list):
+                for raw in briefing["must_know"]:
+                    if len(must_know) >= 6:
+                        break
+                    text = str(raw or "").strip()[:60]
+                    if text:
+                        must_know.append(text)
+            alerts: list[dict[str, Any]] = []
+            consumed: set[int] = set()
+            if isinstance(briefing.get("exam_alerts"), list):
+                for raw in briefing["exam_alerts"]:
+                    if len(alerts) >= 6:
+                        break
+                    if not isinstance(raw, dict):
+                        continue
+                    category = str(raw.get("category") or "").strip()
+                    title = str(raw.get("title") or "").strip()[:30]
+                    if not title or category not in ASSESSMENT_CATEGORIES:
+                        continue
+                    # 只改写不新造：category 相同且标题与某条未消费事件的
+                    # title/due_hint/quote 足够相似（复用 takeaway 锚 Dice 阈值
+                    # 家规）；匹配不到 = LLM 新造，一律丢弃。
+                    match = next(
+                        (
+                            index for index, event in enumerate(assessment_events)
+                            if index not in consumed
+                            and event.get("category") == category
+                            and _takeaway_anchor_ms(
+                                title,
+                                [(
+                                    0,
+                                    f"{event.get('title') or ''} "
+                                    f"{event.get('due_hint') or ''} "
+                                    f"{event.get('quote') or ''}",
+                                )],
+                            )
+                            is not None
+                        ),
+                        None,
+                    )
+                    if match is None:
+                        continue
+                    consumed.add(match)
+                    alerts.append({
+                        "category": category,
+                        "title": title,
+                        "due_hint": str(raw.get("due_hint") or "").strip()[:20],
+                    })
+            views["briefing"] = {
+                "speed_read": speed_read,
+                "must_know": must_know,
+                "exam_alerts": alerts,
+            }
+    if not views:
+        return None, anchor_rejected, citation_rejected
+    return views, anchor_rejected, citation_rejected
+
+
+def _derive_review_views(
+    api_key: str,
+    *,
+    views_input: dict[str, Any],
+    tier: dict[str, str] | None,
+    usage_records: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, int]]:
+    """P2 合同 §②：一次四档的独立派生调用。
+
+    attempts=2、backoff 同总结链；坏 JSON 先同族对象抢救再计失败；usage 逐
+    调用立即落 usage_records（与窗口/合并同一账本，失败尝试不丢账）。传输层
+    LLMError 向上抛由调用方 fail-open。返回 (views|None, stats)：views 为
+    校验后的四档子集（全畸形=None），stats 携带重试/拒绝计数（零内容）。
+    """
+    stats: dict[str, int] = {
+        "retries": 0, "failed": 0, "anchor_rejected": 0, "citation_rejected": 0,
+    }
+    anchor_pool = {int(value) for value in views_input.get("anchor_pool") or ()}
+    allowed_citations = {
+        str(item.get("citation_id") or "").strip()
+        for item in views_input.get("evidence_index") or ()
+        if isinstance(item, dict)
+    } - {""}
+    events = [
+        item
+        for item in (views_input.get("note") or {}).get("assessment_events") or ()
+        if isinstance(item, dict)
+    ]
+    messages = [
+        {"role": "system", "content": _REVIEW_VIEWS_PROMPT},
+        {"role": "user", "content": json.dumps(views_input, ensure_ascii=False)},
+    ]
+    for attempt in range(_REVIEW_VIEWS_ATTEMPTS):
+        try:
+            raw = _chat(
+                api_key, messages, max_tokens=_REVIEW_VIEWS_MAX_TOKENS, thinking=tier,
+            )
+        finally:
+            usage_records.extend(drain_call_log())
+        candidate: Any = None
+        try:
+            candidate = _json_content(raw)
+        except LLMError:
+            candidate = _salvage_views_object(raw)
+        views, anchor_rejected, citation_rejected = _validate_review_views(
+            candidate,
+            anchor_pool=anchor_pool,
+            allowed_citations=allowed_citations,
+            assessment_events=events,
+        )
+        if views is not None:
+            stats["anchor_rejected"] = anchor_rejected
+            stats["citation_rejected"] = citation_rejected
+            return views, stats
+        if attempt + 1 < _REVIEW_VIEWS_ATTEMPTS:
+            stats["retries"] += 1
+            _emit_telemetry(f"stage=review-views-retry attempt={attempt + 1}")
+            time.sleep(_REVIEW_VIEWS_RETRY_BACKOFF_SECONDS)
+    stats["failed"] = 1
+    return None, stats
+
+
 def create_summary(
     api_key: str,
     *,
@@ -1682,10 +2011,11 @@ def create_summary(
                 continue
             category = str(item.get("category") or "")
             quote = str(item.get("quote") or "").strip()[:80]
-            title = str(item.get("title") or "").strip()[:30]
+            # 循环内不得遮蔽函数参数 title（P2 视图派生的 views_input 依赖它）。
+            event_title = str(item.get("title") or "").strip()[:30]
             if (
                 category not in ASSESSMENT_CATEGORIES
-                or not title
+                or not event_title
                 or not quote
                 or quote not in parts_text
             ):
@@ -1693,7 +2023,7 @@ def create_summary(
                 continue
             events.append({
                 "category": category,
-                "title": title,
+                "title": event_title,
                 "due_hint": str(item.get("due_hint") or "").strip()[:20],
                 "quote": quote,
             })
@@ -1725,6 +2055,70 @@ def create_summary(
     topics = validate_topic_candidates(
         value.get("topic_candidates") if packet is not None else None
     )
+    # P2-CONTRACT-1 §②：多视图复习包派生。收口在 create_summary 内部——
+    # off=零调用零开销；检查点带 review_views 直接复用不重调；任何失败
+    # fail-open（summary 照常落地，无 review_views 键，前端零 LLM 版照常）。
+    review_views: dict[str, Any] | None = None
+    view_stats: dict[str, int] = {
+        "retries": 0, "failed": 0, "anchor_rejected": 0, "citation_rejected": 0,
+    }
+    if _review_views_enabled():
+        prior_views = prior.get("review_views")
+        if isinstance(prior_views, dict):
+            review_views = prior_views
+        else:
+            views_input: dict[str, Any] = {
+                "title": title,
+                "note": {
+                    "markdown": value["markdown"].strip()[:_REVIEW_VIEWS_MARKDOWN_CAP],
+                    "chapters": chapters,
+                    "key_takeaways": takeaways,
+                    "assessment_events": events,
+                    "knowledge_points": knowledge_points,
+                },
+                "anchor_pool": sorted(valid_anchors),
+            }
+            # evidence_index 与合并输入同源同对象（evidence_index(packet)）；
+            # 无 packet 时整个键省略（合同 I8）。
+            if packet is not None:
+                views_input["evidence_index"] = merge_input["evidence_index"]
+            if terms:
+                views_input["glossary"] = terms
+            try:
+                review_views, view_stats = _derive_review_views(
+                    api_key, views_input=views_input, tier=tier,
+                    usage_records=usage_records,
+                )
+            except LLMError:
+                review_views = None
+                view_stats["failed"] = 1
+            if review_views is not None:
+                # 派生成功后检查点增量写 review_views 键：窗口计划比对语义
+                # 不动；旧检查点无此键=照常派生。
+                if checkpoint is not None:
+                    checkpoint({
+                        "stage": "summary",
+                        "completed_chunks": len(sources),
+                        "total_chunks": len(sources) + 1,
+                        "summary_completed_windows": len(sources),
+                        "summary_window_plan": plan,
+                        "summary_evidence_windows": len(evidence_windows),
+                        "summary_parts": parts,
+                        "review_views": review_views,
+                    })
+                _emit_telemetry(
+                    f"stage=review-views "
+                    f"study_guide={len(review_views.get('study_guide', {}).get('items') or ())} "
+                    f"faq={len(review_views.get('faq', {}).get('items') or ())} "
+                    f"timeline={len(review_views.get('timeline', {}).get('events') or ())} "
+                    f"briefing={1 if isinstance(review_views.get('briefing'), dict) else 0} "
+                    f"anchor_rejected={view_stats['anchor_rejected']} "
+                    f"citation_rejected={view_stats['citation_rejected']}"
+                )
+            else:
+                _emit_telemetry(
+                    f"stage=review-views-failed retries={view_stats['retries']}"
+                )
     # 夜10-C 可观测性：摘要链收口遥测（与校对链同纪律：计数与闭集词，
     # 零提示词、零响应文本、零字幕/笔记内容）。SUMMARY-FIX-1 追加思考档/
     # 重试/降级/深账计数（同为闭集计数词）。
@@ -1734,6 +2128,7 @@ def create_summary(
         "window_retries": window_retries,
         "window_skipped": window_skipped,
         "merge_retries": merge_retries,
+        "views_retries": view_stats["retries"],
     }
     if usage_sink is not None:
         usage_sink.extend(usage_records)
@@ -1751,7 +2146,7 @@ def create_summary(
         f"completion_tokens={deep_usage['completion_tokens']} "
         f"reasoning_tokens={deep_usage['reasoning_tokens']}"
     )
-    return {
+    result = {
         "model": MODEL,
         "markdown": value["markdown"].strip(),
         "chapters": chapters,
@@ -1774,6 +2169,11 @@ def create_summary(
         # outputs["subtitle"]["deep_usage"] 同形对称；计数器零内容）。
         "deep_usage": deep_usage,
     }
+    # P2 合同 §②：派生失败/关闭=无 review_views 键（不落 artifact 的
+    # fail-open 形态）；成功=四档子集（全畸形档省键）。
+    if review_views is not None:
+        result["review_views"] = review_views
+    return result
 
 
 # ---- RR-P5HARD-1：answer_question 本体加固（SUMMARY-FIX-1/6fbd077 同族） ----

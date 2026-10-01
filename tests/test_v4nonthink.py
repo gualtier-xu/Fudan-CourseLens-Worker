@@ -507,13 +507,16 @@ class SummaryGlossaryTests(unittest.TestCase):
     def test_glossary_flows_into_window_prompt_and_merge_input(self):
         from courselens_worker.llm import (
             _SUMMARY_WINDOW_PROMPT_WITH_GLOSSARY,
+            REVIEW_VIEWS_ENV,
             create_summary,
         )
 
         window = {"markdown": "笔记", "chapters": []}
         merge = {"markdown": "# 笔记", "chapters": []}
         _chat, calls = self._chat_recorder([window, merge])
-        with patch("courselens_worker.llm._chat", _chat):
+        # 本钉=window 提示词变体与 merge 数据通道（视图派生在 test_review_views.py）。
+        with patch("courselens_worker.llm._chat", _chat), \
+                patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
             create_summary(
                 "key", title="t", transcript=[{"start_ms": 0, "end_ms": 900, "text": "内容"}],
                 ppt_pages=[], glossary=("能带图", "电势"),

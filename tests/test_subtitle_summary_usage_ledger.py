@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 import unittest
+import os
 from unittest.mock import patch
 
 from courselens_worker import llm as llm_mod
+from courselens_worker.llm import REVIEW_VIEWS_ENV
 from courselens_worker.runner import _process_materialized_job
 
 
@@ -178,17 +180,19 @@ class SummaryUsageLedgerTests(unittest.TestCase):
                 return json.dumps({"markdown": "combined", "chapters": []})
             return json.dumps({"markdown": "part", "chapters": []})
 
-        with patch("courselens_worker.llm._chat", side_effect=_fake_chat):
-            value = llm_mod.create_summary(
-                "k",
-                title="t",
-                transcript=[
-                    {"start_ms": index * 1000, "end_ms": (index + 1) * 1000, "text": f"text-{index}"}
-                    for index in range(130)
-                ],
-                ppt_pages=[],
-                usage_sink=sink,
-            )
+        # 本钉=窗口+合并两调用的账面形状（视图派生账面在 test_review_views.py）。
+        with patch.dict(os.environ, {REVIEW_VIEWS_ENV: "off"}):
+            with patch("courselens_worker.llm._chat", side_effect=_fake_chat):
+                value = llm_mod.create_summary(
+                    "k",
+                    title="t",
+                    transcript=[
+                        {"start_ms": index * 1000, "end_ms": (index + 1) * 1000, "text": f"text-{index}"}
+                        for index in range(130)
+                    ],
+                    ppt_pages=[],
+                    usage_sink=sink,
+                )
 
         self.assertEqual(value["markdown"], "combined")
         # 130 段 → 2 窗 + 1 合并 = 3 次调用，全部落账。
