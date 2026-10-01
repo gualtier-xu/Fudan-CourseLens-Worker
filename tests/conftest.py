@@ -26,5 +26,8 @@ def _stub_if_missing(module_name: str) -> None:
     sys.modules[module_name] = Mock()
 
 
-for _name in ("sherpa_onnx", "numpy"):
+# rapidocr_onnxruntime：learning_pack 分支入口局部导入 ocr；answer-only 钉
+# （RR-PARK-1 P2）不触 OCR 但需模块可导入（客户端 venv 无重依赖，与
+# sherpa_onnx 同款桩纪律）。
+for _name in ("sherpa_onnx", "numpy", "rapidocr_onnxruntime"):
     _stub_if_missing(_name)

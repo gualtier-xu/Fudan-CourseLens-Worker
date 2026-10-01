@@ -62,7 +62,15 @@ class RaisingSession:
 
 
 def _mailbox(session=None) -> IssueMailbox:
-    box = IssueMailbox("student/jobs", "tok")
+    # RR-FIX452-1：默认走不限速/零退避参数，既有用例不因发布节流变慢；
+    # 节流与重试语义由 test_checkpoint_publish.py 专测。
+    box = IssueMailbox(
+        "student/jobs",
+        "tok",
+        publish_rate_per_minute=6e7,
+        publish_burst=1e6,
+        retry_waits=(0.0, 0.0, 0.0),
+    )
     if session is not None:
         box.session = session
     return box

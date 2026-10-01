@@ -144,3 +144,60 @@ def test_legacy_merge_prompt_never_mentions_the_new_output_keys():
     """旧路径的模型输出与历史一致：旧提示词不提知识点/主题候选。"""
     assert "knowledge_points" not in _SUMMARY_MERGE_PROMPT
     assert "topic_candidates" not in _SUMMARY_MERGE_PROMPT
+
+
+def _transcript() -> list[dict]:
+    return [
+        {"start_ms": 0, "end_ms": 30_000, "text": "链式聚合反应最主要的特征是逐步聚合，分子量随转化率上升。"},
+        {"start_ms": 30_000, "end_ms": 60_000, "text": "接下来讲凝胶化现象和临界转化 crazily 无关词。"},
+    ]
+
+
+def test_takeaway_anchors_align_and_stay_in_whitelist():
+    """RR-QWIN-1 Q1：takeaway 锚=本地派生（零新调用），与 key_takeaways
+    等长对齐；锚值只取 valid_anchors 白名单（字幕段/合法 chapters），无把握
+    时为 None（fail-closed：锚错比锚缺更伤信任）。"""
+    merge_payload = {
+        "markdown": "# 笔记",
+        "chapters": [{"title": "链式聚合", "start_ms": 0, "summary": "链式聚合：分子量随转化率上升，注意凝胶化。"}],
+        "key_takeaways": ["链式聚合的分子量随转化率上升", "完全无关的一句闲聊"],
+        "assessment_events": [],
+    }
+    _chat, _ = _chat_responder([_base_window(), merge_payload])
+    with patch("courselens_worker.llm._chat", _chat):
+        value = create_summary("key", title="t", transcript=_transcript(), ppt_pages=[])
+    assert len(value["takeaway_anchors"]) == len(value["key_takeaways"]) == 2
+    valid = {0, 30_000}
+    first = value["takeaway_anchors"][0]
+    assert first in valid
+    assert value["takeaway_anchors"][1] is None
+
+
+def test_takeaway_anchors_survive_chapter_only_inputs():
+    """合并产物 chapters 是合法锚源：transcript 为空时锚仍可落在章节 start_ms
+    （start_ms 已过 valid_anchors 校验），对齐关系不因输入面变化而破坏。"""
+    merge_payload = {
+        "markdown": "# 笔记",
+        "chapters": [{"title": "凝胶化", "start_ms": 45_000, "summary": "凝胶化现象与临界转化率。"}],
+        "key_takeaways": ["凝胶化出现在临界转化率附近"],
+        "assessment_events": [],
+    }
+    _chat, _ = _chat_responder([_base_window(), merge_payload])
+    with patch("courselens_worker.llm._chat", _chat):
+        value = create_summary("key", title="t", transcript=[], ppt_pages=[{"created_sec": 45}])
+    assert value["takeaway_anchors"] == [45_000]
+
+
+def test_takeaway_anchors_fail_closed_without_candidates():
+    """无候选（无字幕段、无合法章节、无幻灯锚）时全部 None：不渲染锚而非
+    报错，绝不产出白名单之外的锚值。"""
+    merge_payload = {
+        "markdown": "# 笔记",
+        "chapters": [],
+        "key_takeaways": ["要点一", "要点二"],
+        "assessment_events": [],
+    }
+    _chat, _ = _chat_responder([_base_window(), merge_payload])
+    with patch("courselens_worker.llm._chat", _chat):
+        value = create_summary("key", title="t", transcript=[], ppt_pages=[])
+    assert value["takeaway_anchors"] == [None, None]

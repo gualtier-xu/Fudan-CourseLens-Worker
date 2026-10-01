@@ -218,7 +218,8 @@ class RunnerOrderTests(unittest.TestCase):
             slides=[{"page_num": 1, "created_sec": 0, "source": {}}],
         )
 
-        def fake_summary(api_key, *, title, transcript, ppt_pages, prior_checkpoint, checkpoint):
+        def fake_summary(api_key, *, title, transcript, ppt_pages, prior_checkpoint, checkpoint,
+                         usage_sink=None):
             checkpoint({
                 "stage": "summary",
                 "completed_chunks": 1,
