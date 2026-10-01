@@ -1017,6 +1017,40 @@ def _process_materialized_job(
                 metrics["knowledge_points"] = len(list(summary.get("knowledge_points") or []))
                 metrics["citations_rejected"] = int(summary.get("citations_rejected") or 0)
         metrics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    elif kind == "quality_judge":
+        # P11-CONTRACT-1 PKG-A：LLM-as-judge 离线质检（字幕样本/总结两独立
+        # 小调用）。无 llm_pending 本地领回降级：LLMError 原样上抛=任务诚实
+        # 失败，客户端 re-POST 即重试；mode 形状无效置 null 由 judge 函数契约
+        # 保证，这里只诚实计入 warnings。
+        from .llm import LLMError, judge_lecture_quality
+
+        payload = dict(job.get("payload") or {})
+        subtitle_sample = payload.get("subtitle_sample")
+        summary_pack = payload.get("summary_pack")
+        transcript = list((summary_pack or {}).get("transcript") or [])
+        quality_usage: list[dict[str, Any]] = []
+        report = judge_lecture_quality(
+            str(dict(job.get("secrets") or {}).get("deepseek_api_key") or ""),
+            subtitle_sample=subtitle_sample,
+            summary_pack=summary_pack,
+            glossary=tuple(str(term) for term in (payload.get("glossary") or ())),
+            usage_sink=quality_usage,
+        )
+        if subtitle_sample is not None and report.get("subtitle") is None:
+            warnings.append("judge_mode_invalid")
+        if summary_pack is not None and report.get("summary") is None:
+            warnings.append("judge_mode_invalid")
+        outputs = {"quality_judge": report}
+        metrics = {
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "transcript_segments": len(transcript),
+        }
+        # RR-ACCOUNT2-1 同式：质检任务的真实 token 随结果上报（纯观测计数）。
+        metrics["deepseek_tokens"] = metrics.get("deepseek_tokens", 0) + sum(
+            max(0, int(record.get("prompt_tokens") or 0))
+            + max(0, int(record.get("completion_tokens") or 0))
+            for record in quality_usage
+        )
     else:
         raise WorkerError("unsupported job kind")
     return {

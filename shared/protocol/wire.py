@@ -97,6 +97,7 @@ def validate_job(job: dict[str, Any], *, now: float | None = None) -> dict[str, 
         raise ProtocolError("unsupported protocol version")
     if job.get("job_kind") not in {
         "echo", "process_canary", "subtitle", "summary", "chapters", "learning_pack",
+        "quality_judge",  # P11-CONTRACT-1 PKG-A：LLM-as-judge 离线质检（加性注册）。
     }:
         raise ProtocolError("unsupported job kind")
     created_at = float(job.get("created_at") or 0)
@@ -306,6 +307,7 @@ def open_result(
         raise ProtocolError("result input_hash mismatch")
     if value.get("job_kind") not in {
         "echo", "process_canary", "subtitle", "summary", "chapters", "learning_pack",
+        "quality_judge",  # P11-CONTRACT-1 PKG-A：与 job intake 闭集同步加性注册。
     }:
         raise ProtocolError("result job kind is invalid")
     if value.get("job_kind") == "process_canary":
