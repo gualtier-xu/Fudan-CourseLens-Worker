@@ -15,7 +15,7 @@ CourseLens 客户端（Windows）从这里发布。顺利的话，一两分钟�
 
 **官方发布页：[gualtier-xu/Fudan-CourseLens-Worker · Releases](https://github.com/gualtier-xu/Fudan-CourseLens-Worker/releases)** ｜ 问题反馈：[官方仓 Issues](https://github.com/gualtier-xu/Fudan-CourseLens-Worker/issues)
 
-1. **下载并校验**：到[官方发布页](https://github.com/gualtier-xu/Fudan-CourseLens-Worker/releases)下载 `CourseLens-0.1.0-setup.exe`，它旁边有一份《校验单》。校验就像核对快递单号：在安装包所在的文件夹，地址栏输入 `powershell` 回车，执行 `certutil -hashfile CourseLens-0.1.0-setup.exe SHA256`，把输出的一串数字和《校验单》对一致再装——确认你拿到的文件和发布的那份逐字节一致。
+1. **下载并校验**：到[官方发布页](https://github.com/gualtier-xu/Fudan-CourseLens-Worker/releases)下载 `CourseLens-0.1.0-setup.exe`，它旁边有一份《校验单》（发布页文件名 `CourseLens-0.1.0-checksum.txt`）。校验就像核对快递单号：在安装包所在的文件夹，地址栏输入 `powershell` 回车，执行 `certutil -hashfile CourseLens-0.1.0-setup.exe SHA256`，把输出的一串数字和《校验单》对一致再装——确认你拿到的文件和发布的那份逐字节一致。
 2. **安装**：双击 setup.exe。如果 Windows 弹出「已保护你的电脑」，点「更多信息」→「仍要运行」——每一步长什么样、为什么要这一步，见[《Windows 安全提示图文指引》](https://github.com/gualtier-xu/Fudan-CourseLens-Worker/releases/download/client-v0.1.0/windows-security-prompt.md)。注意：安装包只负责**第一次安装**，以后的升级都在应用内完成，不要重复运行 setup.exe。
 3. **登录选课**：打开 CourseLens，按首跑引导用复旦统一身份认证登录（学号密码只输入客户端本地的受保护表单），然后选择你有权访问的课程就能开始。想用 AI 校对与问答，还可以在设置里填入你自己的 DeepSeek API Key（可选，不填也有高精度非 AI 字幕回退）。
 
