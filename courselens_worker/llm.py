@@ -2325,3 +2325,359 @@ def answer_question(
     if not grounded:
         return {"answer": "资料不足，无法根据当前课程资料回答。", "citations": [], "grounded": False}
     return {"answer": value["answer"].strip(), "citations": citations[:8], "grounded": True}
+
+
+# ---- P11-CONTRACT-1 PKG-A：LLM-as-judge 离线质检（字幕样本/总结抽检） ----
+# 每讲按需 1-2 次小调用；只出闭集 findings（零自由文本、零整数分——分数由客
+# 户端从计数派生，judge 幻觉面最小化）；时间戳完整性属确定性检验，由客户端
+# import 时对 DB 现算，不经 LLM 不经 payload。缺省关思考（与 SUMMARY/QUESTION
+# 同判同闭集）；usage 走 usage_sink 同一账本；无本地领回降级，传输失败原样
+# 上抛=任务诚实失败，re-POST 即重试。
+JUDGE_THINKING_ENV = "COURSELENS_JUDGE_THINKING"
+JUDGE_THINKING: dict[str, str] | None = {"type": "disabled"}
+_JUDGE_MAX_TOKENS = 8192             # 非思考档输出帽（QUESTION 家族同值）
+_JUDGE_THINKING_MAX_TOKENS = 16384   # 思考档输出帽（推理计入 max_tokens）
+_JUDGE_ATTEMPTS = 2                  # 瞬态失败重试恰一次，再败按 mode 语义收口
+_JUDGE_RETRY_BACKOFF_SECONDS = 1.0
+# 6fbd077 家规：429 限流与授权类绝不入 stage 级重试集（与 answer 同集）。
+_JUDGE_NO_RETRY_STATUSES = frozenset({401, 403, 429})
+# 冻结闭集（P11-CONTRACT-1 §②；后续实施包不得改动）。
+_JUDGE_SEVERITIES = frozenset({"warn", "info"})
+_JUDGE_SUBTITLE_TARGETS = frozenset({"segment"})
+_JUDGE_SUBTITLE_DIMENSIONS = frozenset({"term_fidelity", "readability"})
+_JUDGE_SUBTITLE_CODES = frozenset({
+    "glossary_violation", "homophone_suspect", "term_inconsistent",
+    "broken_flow", "garbled",
+})
+_JUDGE_SUMMARY_TARGETS = frozenset({"chapter", "takeaway", "body"})
+_JUDGE_SUMMARY_DIMENSIONS = frozenset({"factuality", "alignment", "readability"})
+_JUDGE_SUMMARY_CODES = frozenset({
+    "no_source_support", "contradicts_source", "chapter_mislabel",
+    "duplicate_content", "empty_section",
+})
+_JUDGE_FINDINGS_CAP = 24
+
+_JUDGE_SUBTITLE_PROMPT = (
+    "字幕质检员。只依据输入样本段与 glossary 找问题；没有问题"
+    "输出空 findings；禁止编造输入外的问题。输出{\"findings\":[每项"
+    "target、position、dimension、code、severity]}，target=segment，"
+    "dimension=term_fidelity/readability，code=glossary_violation/"
+    "homophone_suspect/term_inconsistent/broken_flow/garbled，"
+    "severity=warn/info。零自由文本。"
+)
+_JUDGE_SUMMARY_PROMPT = (
+    "课程笔记质检员。只依据输入总结与字幕找问题；没有问题"
+    "输出空 findings；禁止编造输入外的问题。输出{\"findings\":[每项"
+    "target、position、dimension、code、severity]}，target=chapter/"
+    "takeaway/body，dimension=factuality/alignment/readability，code="
+    "no_source_support/contradicts_source/chapter_mislabel/duplicate_content/"
+    "empty_section，severity=warn/info。零自由文本。"
+)
+
+
+def _resolve_judge_thinking() -> dict[str, str] | None:
+    raw = os.environ.get(JUDGE_THINKING_ENV, "").strip().lower()
+    if not raw:
+        return JUDGE_THINKING
+    if raw in {"default", "provider-default"}:
+        return None
+    if raw == "disabled":
+        return {"type": "disabled"}
+    if raw in {"low", "high", "max"}:
+        return {"type": "enabled", "reasoning_effort": raw}
+    return JUDGE_THINKING
+
+
+def _judge_status_no_retry(exc: Exception) -> bool:
+    match = re.fullmatch(r"AI request returned HTTP (\d{3})", str(exc))
+    return bool(match) and int(match.group(1)) in _JUDGE_NO_RETRY_STATUSES
+
+
+def _salvage_judge_findings(text: str) -> dict[str, Any] | None:
+    """Recover a judge findings object from a chatty or truncated reply.
+
+    _salvage_summary_object 同族：①整体花括号切片解析（chatty 前后缀）；②
+    截断响应逐个回收已完成的扁平 findings 对象（judge 条目无嵌套花括号，逐
+    对象扫描恰好命中已完成条目；坏条目进不了正文，闭集校验照走）。两级都空
+    返回 None，由调用方计入重试。
+    """
+    value = str(text or "").strip()
+    if value.startswith("```"):
+        value = value.split("\n", 1)[-1].rsplit("```", 1)[0]
+    start = value.find("{")
+    end = value.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(value[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    recovered: list[Any] = []
+    for match in re.finditer(r"\{[^{}]*\}", value):
+        try:
+            item = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            recovered.append(item)
+    if recovered:
+        return {"findings": recovered}
+    return None
+
+
+def _judge_findings_kept(valid: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """数量帽截断（合同 §②）：超出 24 条保 warn 优先，各自保持原相对顺序。"""
+    if len(valid) <= _JUDGE_FINDINGS_CAP:
+        return valid, 0
+    warns = [item for item in valid if item["severity"] == "warn"]
+    infos = [item for item in valid if item["severity"] != "warn"]
+    kept = (warns + infos)[:_JUDGE_FINDINGS_CAP]
+    return kept, len(valid) - len(kept)
+
+
+def _validate_judge_subtitle(
+    candidate: Any,
+    *,
+    sample_size: int,
+) -> tuple[dict[str, Any] | None, int, int]:
+    """字幕 mode 闭集校验（合同 §② 纪律，worker 侧）。
+
+    findings 非 list 或元素非 dict → mode 整体置 None（judge_mode_invalid）；
+    target/dimension/code/severity/position 逐项对闭集，越界条目丢弃并计数；
+    只保留五个冻结键（零自由文本——任何 note/quote 附加字段都进不了报告）；
+    数量帽截断保 warn 优先。返回 (mode 结果|None, invalid_dropped, truncated)。
+    """
+    raw = candidate.get("findings") if isinstance(candidate, dict) else None
+    if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+        return None, 0, 0
+    valid: list[dict[str, Any]] = []
+    dropped = 0
+    for item in raw:
+        position = item.get("position")
+        if (
+            item.get("target") not in _JUDGE_SUBTITLE_TARGETS
+            or item.get("dimension") not in _JUDGE_SUBTITLE_DIMENSIONS
+            or item.get("code") not in _JUDGE_SUBTITLE_CODES
+            or item.get("severity") not in _JUDGE_SEVERITIES
+            or isinstance(position, bool)
+            or not isinstance(position, int)
+            or not 0 <= position < sample_size
+        ):
+            dropped += 1
+            continue
+        valid.append({
+            "target": item["target"],
+            "position": position,
+            "dimension": item["dimension"],
+            "code": item["code"],
+            "severity": item["severity"],
+        })
+    kept, truncated = _judge_findings_kept(valid)
+    return (
+        {"sample_size": sample_size, "targets_total": sample_size, "findings": kept},
+        dropped,
+        truncated,
+    )
+
+
+def _validate_judge_summary(
+    candidate: Any,
+    *,
+    chapters_total: int,
+    takeaways_total: int,
+) -> tuple[dict[str, Any] | None, int, int]:
+    """总结 mode 闭集校验（同上纪律）：body 恒 position 0；chapter/takeaway
+    position 各自越界丢弃；targets_total=chapters+takeaways+1（正文）。"""
+    raw = candidate.get("findings") if isinstance(candidate, dict) else None
+    if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+        return None, 0, 0
+    valid: list[dict[str, Any]] = []
+    dropped = 0
+    for item in raw:
+        target = item.get("target")
+        position = item.get("position")
+        if target == "body":
+            position_ok = (
+                isinstance(position, int)
+                and not isinstance(position, bool)
+                and position == 0
+            )
+        else:
+            bound = chapters_total if target == "chapter" else takeaways_total
+            position_ok = (
+                isinstance(position, int)
+                and not isinstance(position, bool)
+                and 0 <= position < bound
+            )
+        if (
+            target not in _JUDGE_SUMMARY_TARGETS
+            or item.get("dimension") not in _JUDGE_SUMMARY_DIMENSIONS
+            or item.get("code") not in _JUDGE_SUMMARY_CODES
+            or item.get("severity") not in _JUDGE_SEVERITIES
+            or not position_ok
+        ):
+            dropped += 1
+            continue
+        valid.append({
+            "target": target,
+            "position": position,
+            "dimension": item["dimension"],
+            "code": item["code"],
+            "severity": item["severity"],
+        })
+    kept, truncated = _judge_findings_kept(valid)
+    return (
+        {"targets_total": chapters_total + takeaways_total + 1, "findings": kept},
+        dropped,
+        truncated,
+    )
+
+
+def _judge_mode_call(
+    api_key: str,
+    *,
+    system_prompt: str,
+    mode_input: dict[str, Any],
+    tier: dict[str, str] | None,
+    max_tokens: int,
+    usage_records: list[dict[str, Any]],
+    validate: Callable[[Any], tuple[dict[str, Any] | None, int, int]],
+) -> tuple[dict[str, Any] | None, int, int]:
+    """单 mode 独立小调用（两 mode 各走一次）：attempts=2、backoff 同族；坏
+    JSON 先同族抢救再计失败；usage 逐调用立即落 usage_records（失败尝试不丢
+    账）。传输 LLMError 原样上抛（无本地降级，任务诚实失败）；形状两败返回
+    mode=None（judge_mode_invalid，全部被评 mode 同败由调用方 fail-closed）。"""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps(mode_input, ensure_ascii=False)},
+    ]
+    last_transport: LLMError | None = None
+    for attempt in range(_JUDGE_ATTEMPTS):
+        try:
+            try:
+                raw = _chat(api_key, messages, max_tokens=max_tokens, thinking=tier)
+            finally:
+                usage_records.extend(drain_call_log())
+        except LLMError as exc:
+            # 429 限流/授权类绝不入重试集（6fbd077 家规）：传输层已按
+            # Retry-After 有界退避过，stage 级再试=hammer 限流器。
+            if _judge_status_no_retry(exc):
+                raise
+            last_transport = exc
+        else:
+            try:
+                candidate = _json_content(raw)
+            except LLMError:
+                candidate = _salvage_judge_findings(raw)
+            mode_result, dropped, truncated = validate(candidate)
+            if mode_result is not None:
+                return mode_result, dropped, truncated
+        if attempt + 1 < _JUDGE_ATTEMPTS:
+            _emit_telemetry(f"stage=quality-judge-retry attempt={attempt + 1}")
+            time.sleep(_JUDGE_RETRY_BACKOFF_SECONDS)
+    if last_transport is not None:
+        raise last_transport
+    return None, 0, 0
+
+
+def judge_lecture_quality(
+    api_key: str,
+    *,
+    subtitle_sample: dict[str, Any] | None = None,
+    summary_pack: dict[str, Any] | None = None,
+    glossary: tuple[str, ...] = (),
+    usage_sink: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """P11 离线质检：字幕样本与总结两独立小调用（每讲恰 1-2 次）。
+
+    冻结 schema（P11-CONTRACT-1 §②）：只出闭集 findings，零自由文本零整数
+    分；mode 形状无效置 null（调用方计 judge_mode_invalid），全部被评 mode 同
+    时无效 fail-closed 抛 LLMError。遥测仅计数（零内容零 URL 零账号值）。
+    """
+    if subtitle_sample is None and summary_pack is None:
+        raise ValueError("quality judge requires subtitle_sample or summary_pack")
+    tier = _resolve_judge_thinking()
+    max_tokens = (
+        _JUDGE_MAX_TOKENS
+        if (tier or {}).get("type") == "disabled"
+        else _JUDGE_THINKING_MAX_TOKENS
+    )
+    usage = usage_sink if usage_sink is not None else []
+    stats = {"truncated": 0, "invalid_dropped": 0}
+    report: dict[str, Any] = {"schema_version": 1, "subtitle": None, "summary": None}
+
+    if subtitle_sample is not None:
+        sample_segments = [
+            item for item in (subtitle_sample.get("segments") or [])
+            if isinstance(item, dict)
+        ]
+        sample_size = len(sample_segments)
+        subtitle_input: dict[str, Any] = {"segments": sample_segments}
+        terms = [str(term).strip() for term in (glossary or ()) if str(term).strip()]
+        if terms:
+            subtitle_input["glossary"] = terms
+        mode, dropped, truncated = _judge_mode_call(
+            api_key,
+            system_prompt=_JUDGE_SUBTITLE_PROMPT,
+            mode_input=subtitle_input,
+            tier=tier,
+            max_tokens=max_tokens,
+            usage_records=usage,
+            validate=lambda candidate: _validate_judge_subtitle(
+                candidate, sample_size=sample_size,
+            ),
+        )
+        report["subtitle"] = mode
+        stats["invalid_dropped"] += dropped
+        stats["truncated"] += truncated
+
+    if summary_pack is not None:
+        chapters = [
+            item for item in (summary_pack.get("chapters") or [])
+            if isinstance(item, dict)
+        ]
+        takeaways = [
+            str(item) for item in (summary_pack.get("key_takeaways") or [])
+            if str(item or "").strip()
+        ]
+        transcript = [
+            item for item in (summary_pack.get("transcript") or [])
+            if isinstance(item, dict)
+        ]
+        mode, dropped, truncated = _judge_mode_call(
+            api_key,
+            system_prompt=_JUDGE_SUMMARY_PROMPT,
+            mode_input={
+                "markdown": str(summary_pack.get("markdown") or ""),
+                "chapters": chapters,
+                "key_takeaways": takeaways,
+                "transcript": transcript,
+            },
+            tier=tier,
+            max_tokens=max_tokens,
+            usage_records=usage,
+            validate=lambda candidate: _validate_judge_summary(
+                candidate,
+                chapters_total=len(chapters),
+                takeaways_total=len(takeaways),
+            ),
+        )
+        report["summary"] = mode
+        stats["invalid_dropped"] += dropped
+        stats["truncated"] += truncated
+
+    if report["subtitle"] is None and report["summary"] is None:
+        # 全部被评 mode 同时无效：fail-closed（单 mode null 由调用方计
+        # judge_mode_invalid，不构成任务失败）。
+        raise LLMError("quality judge response is invalid in every reviewed mode")
+    subtitle_findings = report["subtitle"]["findings"] if report["subtitle"] else []
+    summary_findings = report["summary"]["findings"] if report["summary"] else []
+    _emit_telemetry(
+        "stage=quality-judge "
+        f"subtitle_findings={len(subtitle_findings)} "
+        f"summary_findings={len(summary_findings)} "
+        f"findings_truncated={stats['truncated']} "
+        f"findings_invalid_dropped={stats['invalid_dropped']}"
+    )
+    return report
