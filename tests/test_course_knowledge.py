@@ -616,7 +616,7 @@ class RunnerEvidenceTests(unittest.TestCase):
         seen = {}
 
         def fake_summary(api_key, *, title, transcript, ppt_pages, prior_checkpoint,
-                         checkpoint):
+                         checkpoint, usage_sink=None):
             seen["kwargs"] = "legacy"
             return {"markdown": "笔记", "chapters": []}
 
@@ -632,7 +632,8 @@ class RunnerEvidenceTests(unittest.TestCase):
         seen = {}
 
         def fake_summary(api_key, *, title, transcript, ppt_pages, prior_checkpoint,
-                         checkpoint, evidence_packet=None, course_context=None):
+                         checkpoint, evidence_packet=None, course_context=None,
+                         usage_sink=None):
             seen["packet"] = evidence_packet
             seen["context"] = course_context
             return {"markdown": "笔记", "chapters": [],
@@ -659,7 +660,7 @@ class RunnerEvidenceTests(unittest.TestCase):
         seen = {}
 
         def fake_summary(api_key, *, title, transcript, ppt_pages, prior_checkpoint,
-                         checkpoint):
+                         checkpoint, usage_sink=None):
             seen["legacy"] = True
             return {"markdown": "笔记", "chapters": []}
 

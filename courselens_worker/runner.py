@@ -129,6 +129,7 @@ def _apply_term_stage(
     warnings: list[str],
     ppt_pages: list[dict[str, Any]] | None = None,
     extra_terms: tuple[str, ...] = (),
+    usage_sink: list[dict[str, Any]] | None = None,
 ) -> None:
     """Term-position deep correction chained after the word-level proofread.
 
@@ -137,7 +138,9 @@ def _apply_term_stage(
     （课程记忆桩，包B 沉淀后接入）。分歧跨度 = transcribe 返回的
     ``proofread_alternates``（rough 槽位原文）。整层在无术语/无 Key/开关关闭时
     零开销跳过；LLM 失败降级并记闭集警告，词级校对结果绝不因此丢失。检查点
-    续跑保留底层 ASR/词级校对状态，术语段零重复计费。
+    续跑保留底层 ASR/词级校对状态，术语段零重复计费。``usage_sink``
+    （RR-ACCOUNT2-1）非 None 时本段 token 流水并入调用方账本（与词级校对段
+    共用一本，任务级 metrics 汇总不重不漏）；缺省维持段内私有账本旧行为。
     """
     if not api_key or os.environ.get(_TERM_PROOFREAD_ENV, "").strip() == "0":
         return
@@ -150,7 +153,7 @@ def _apply_term_stage(
     prior = dict(payload.get("checkpoint") or {})
     preserved = {key: item for key, item in prior.items() if key != "stage"}
     audit: list[dict[str, Any]] = []
-    usage: list[dict[str, Any]] = []
+    usage: list[dict[str, Any]] = usage_sink if usage_sink is not None else []
 
     def term_checkpoint(term_value: dict[str, Any]) -> None:
         if checkpoint_writer is not None:
@@ -332,6 +335,161 @@ class SignedProgressPublisher:
                     self._send_locked(self._latest, now)
 
 
+# ---- RR-FIX452-1（DIAG-1 主判修复）：检查点评论发布降频/节流/降级 ----
+# 每窗检查点照旧逐窗本地落盘（artifact 通道 `if: always()` 上传，续跑粒度
+# 不变）；issue 评论才是洪泛面（452282 实测死亡前 70-75 POST/分钟 → 内容
+# 创建限流即死）。评论发布节奏：跨阶段/阶段收尾必发 + 阶段内 N 窗（块）一发
+# + 90 秒新鲜度兜底；发布线程化（计算循环不等网络），单槽 drop-stale 只保
+# 最新待发全量快照。发布失败经 mailbox 有界重试穷尽后降级记账继续跑——
+# 丢续跑评论点不丢任务（失败面 checkpoint artifact 逐窗仍在，客户端
+# _capture_checkpoint 优先取最新 artifact）。
+_CHECKPOINT_PUBLISH_WINDOWS = 12
+_CHECKPOINT_PUBLISH_CHUNKS = 4
+_CHECKPOINT_PUBLISH_MIN_INTERVAL_SECONDS = 90.0
+_CHECKPOINT_PUBLISH_FLUSH_SECONDS = 45.0
+_STAGE_PROGRESS_KEYS = {
+    "asr": ("completed_chunks", "total_chunks"),
+    "summary": ("completed_chunks", "total_chunks"),
+    "proofread": ("proofread_completed_windows", "proofread_total_windows"),
+    "term_proofread": (
+        "term_proofread_completed_windows",
+        "term_proofread_total_windows",
+    ),
+}
+
+
+def _checkpoint_progress(value: dict[str, Any]) -> tuple[int, int]:
+    """(completed, total) of the checkpoint's own stage; (0, 0) when absent."""
+    keys = _STAGE_PROGRESS_KEYS.get(str(value.get("stage") or ""))
+    if keys is None:
+        return 0, 0
+    try:
+        return int(value.get(keys[0]) or 0), int(value.get(keys[1]) or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+
+
+class _CheckpointCadence:
+    """Decides which per-stage checkpoints earn an issue-comment publish.
+
+    主线程独占调用；`now` 一律由调用方传 time.monotonic() 便于测试。
+    """
+
+    def __init__(self) -> None:
+        self.stage: str | None = None
+        self.completed = -1
+        self.published_at = 0.0
+
+    def _window_size(self, stage: str) -> int:
+        return (
+            _CHECKPOINT_PUBLISH_CHUNKS
+            if stage in {"asr", "summary"}
+            else _CHECKPOINT_PUBLISH_WINDOWS
+        )
+
+    def should_publish(self, value: dict[str, Any], now: float) -> bool:
+        stage = str(value.get("stage") or "work")
+        completed, total = _checkpoint_progress(value)
+        if self.stage != stage:
+            return True
+        if total and completed >= total:
+            return True
+        if completed - self.completed >= self._window_size(stage):
+            return True
+        if (
+            completed > self.completed
+            and now - self.published_at >= _CHECKPOINT_PUBLISH_MIN_INTERVAL_SECONDS
+        ):
+            return True
+        return False
+
+    def mark(self, value: dict[str, Any], now: float) -> None:
+        self.stage = str(value.get("stage") or "work")
+        self.completed, _ = _checkpoint_progress(value)
+        self.published_at = now
+
+
+class _CheckpointPublisher:
+    """Background serialized publisher for checkpoint comments.
+
+    单槽 drop-stale：发布落后于计算时只保留最新待发全量快照（被顶掉的计数
+    进 ``stats["superseded"]``；本地 artifact 从不顶掉）。发布失败按降级记账
+    继续跑（mailbox 已出闭集 retry/failed 行；此处补 checkpoint_publish_
+    degraded 行）。``close`` 汇总一行闭集计数后停线程。
+    """
+
+    def __init__(
+        self,
+        publish,
+        *,
+        flush_timeout: float = _CHECKPOINT_PUBLISH_FLUSH_SECONDS,
+    ):
+        self._publish = publish
+        self._flush_timeout = max(0.0, float(flush_timeout))
+        self._cond = threading.Condition()
+        self._pending: dict[str, Any] | None = None
+        self._closing = False
+        self.stats = {"published": 0, "degraded": 0, "superseded": 0, "skipped": 0}
+        self._thread = threading.Thread(
+            target=self._loop, name="checkpoint-publish", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, value: dict[str, Any]) -> None:
+        with self._cond:
+            if self._pending is not None:
+                self.stats["superseded"] += 1
+            self._pending = value
+            self._cond.notify_all()
+
+    def close(self, *, flush_timeout: float | None = None) -> None:
+        timeout = (
+            self._flush_timeout if flush_timeout is None else max(0.0, float(flush_timeout))
+        )
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            self._closing = True
+            if timeout <= 0:
+                # 零冲刷（失败路径）：弃待发件——在途一发完成后即停。
+                self._pending = None
+            self._cond.notify_all()
+            while self._pending is not None and time.monotonic() < deadline:
+                self._cond.wait(timeout=0.2)
+        self._thread.join(timeout=2)
+        print(
+            f"checkpoint_publish published={self.stats['published']} "
+            f"degraded={self.stats['degraded']} "
+            f"superseded={self.stats['superseded']} skipped={self.stats['skipped']}",
+            flush=True,
+        )
+
+    def _loop(self) -> None:
+        while True:
+            with self._cond:
+                while self._pending is None and not self._closing:
+                    self._cond.wait(timeout=0.5)
+                value, self._pending = self._pending, None
+            if value is not None:
+                try:
+                    self._publish(value)
+                    self.stats["published"] += 1
+                except Exception as exc:
+                    self.stats["degraded"] += 1
+                    name = type(exc).__name__
+                    if name == "MailboxError":
+                        print("checkpoint_publish_degraded stage=checkpoint", flush=True)
+                    else:
+                        print(
+                            f"checkpoint_publish_degraded type={name}", flush=True
+                        )
+                with self._cond:
+                    self._cond.notify_all()
+                continue
+            with self._cond:
+                if self._closing:
+                    return
+
+
 def _process_materialized_job(
     job: dict[str, Any],
     *,
@@ -385,6 +543,9 @@ def _process_materialized_job(
         api_key = str(secrets.get("deepseek_api_key") or "")
         # automatic 策略：仅在配置了 DeepSeek Key 时提供校对提供方；
         # 缺 Key 即走非 AI 回退，由 asr.transcribe 依据 proofread 是否为 None 分派。
+        # RR-ACCOUNT2-1：字幕链统一账本（词级校对窗 + term 深校对段共用
+        # 一本），任务级 metrics 汇总真实 token（纯观测计数）。
+        subtitle_usage: list[dict[str, Any]] = []
         value = transcribe(
             job,
             sensevoice_dir=Path(_required("SENSEVOICE_MODEL_DIR")),
@@ -398,6 +559,7 @@ def _process_materialized_job(
                     refined,
                     prior_checkpoint=prior,
                     checkpoint=write,
+                    usage_sink=subtitle_usage,
                 )) if api_key else None
             ),
             progress=progress,
@@ -409,6 +571,7 @@ def _process_materialized_job(
             payload=payload,
             checkpoint_writer=checkpoint_writer,
             warnings=warnings,
+            usage_sink=subtitle_usage,
         )
         _apply_ct_punc_stage(value, warnings=warnings)
         outputs = {
@@ -425,6 +588,13 @@ def _process_materialized_job(
             }
         }
         metrics = value["metrics"]
+        # RR-ACCOUNT2-1：字幕任务的真实 token 随结果上报（prompt+completion
+        # 与 deep_usage 同口径），月账不再漏记字幕任务族。
+        metrics["deepseek_tokens"] = metrics.get("deepseek_tokens", 0) + sum(
+            max(0, int(record.get("prompt_tokens") or 0))
+            + max(0, int(record.get("completion_tokens") or 0))
+            for record in subtitle_usage
+        )
     elif kind in {"summary", "chapters"}:
         from .course_knowledge import normalize_evidence_packet
         from .lecture_ir import build_lecture_ir
@@ -473,6 +643,11 @@ def _process_materialized_job(
         if _merged_course_terms(payload):
             # V4NONTHINK-1 件6：摘要窗口/合并输入携带课程术语表（笔记写法保险）。
             summary_args["glossary"] = _merged_course_terms(payload)
+            # RR-P6MEM-1：实报注入数（客户端据此加学生可见记忆标注）。
+            metrics["course_memory_terms"] = len(summary_args["glossary"])
+        # RR-ACCOUNT2-1：摘要链（窗口+合并，含失败尝试）统一账本，任务级
+        # metrics 汇总真实 token（纯观测计数）。
+        summary_usage: list[dict[str, Any]] = []
         try:
             summary = create_summary(
                 str(dict(job.get("secrets") or {}).get("deepseek_api_key") or ""),
@@ -481,6 +656,7 @@ def _process_materialized_job(
                 ppt_pages=pages,
                 prior_checkpoint=prior,
                 checkpoint=summary_checkpoint,
+                usage_sink=summary_usage,
                 **summary_args,
             )
         except LLMError:
@@ -537,6 +713,14 @@ def _process_materialized_job(
             "transcript_segments": len(transcript),
             "ppt_pages": len(pages),
         }
+        # RR-ACCOUNT2-1：总结任务的真实 token 随结果上报（prompt+completion
+        # 与 answer 同口径），月账不再漏记总结任务族。llm_pending 降级回执
+        # 不落远端账——该面由客户端本地完成后按既有绝对值口径记账。
+        metrics["deepseek_tokens"] = metrics.get("deepseek_tokens", 0) + sum(
+            max(0, int(record.get("prompt_tokens") or 0))
+            + max(0, int(record.get("completion_tokens") or 0))
+            for record in summary_usage
+        )
         if packet is not None:
             metrics["evidence_items"] = len(packet.get("items") or [])
             metrics["knowledge_points"] = len(list(summary.get("knowledge_points") or []))
@@ -550,7 +734,7 @@ def _process_materialized_job(
         from .formats import to_srt, to_vtt
         from .lecture_ir import build_lecture_ir
         from .glossary import build_glossary
-        from .llm import LLMError, answer_question, create_summary, proofread_segments
+        from .llm import LLMError, answer_question, create_summary, drain_call_log, proofread_segments
         from .ocr import process_slides
 
         payload = dict(job.get("payload") or {})
@@ -591,6 +775,10 @@ def _process_materialized_job(
             "ppt_skipped": slides_skipped,
         } if wants_slides else {}
         if "subtitle" in requested:
+            # RR-ACCOUNT2-1：字幕链统一账本（词级校对窗 + term 深校对段共
+            # 用一本），任务级 metrics 汇总真实 token（纯观测计数）。
+            subtitle_usage: list[dict[str, Any]] = []
+
             def subtitle_checkpoint(value: dict[str, Any]) -> None:
                 if checkpoint_writer is not None:
                     checkpoint_writer({**ocr_fields, **value})
@@ -607,6 +795,7 @@ def _process_materialized_job(
                     prior_checkpoint=saved,
                     checkpoint=write_with_ocr,
                     glossary=build_glossary(pages, str(payload.get("title") or "")),
+                    usage_sink=subtitle_usage,
                 )
 
             value = transcribe(
@@ -634,8 +823,16 @@ def _process_materialized_job(
                 warnings=warnings,
                 ppt_pages=pages if wants_slides else None,
                 extra_terms=build_glossary(pages, str(payload.get("title") or "")),
+                usage_sink=subtitle_usage,
             )
             _apply_ct_punc_stage(value, warnings=warnings)
+            # RR-ACCOUNT2-1：字幕任务的真实 token 随结果上报（prompt+completion
+            # 与 deep_usage/answer 同口径；增量聚合防组合任务分支互相覆盖）。
+            metrics["deepseek_tokens"] = metrics.get("deepseek_tokens", 0) + sum(
+                max(0, int(record.get("prompt_tokens") or 0))
+                + max(0, int(record.get("completion_tokens") or 0))
+                for record in subtitle_usage
+            )
             transcript = value["segments"]
             outputs["subtitle"] = {
                 "mode": value["mode"],
@@ -648,12 +845,30 @@ def _process_materialized_job(
             }
             metrics["subtitle"] = value["metrics"]
         if "answer" in requested:
+            # RR-P6MEM-1：payload 可选课程记忆术语表进问答链（读侧加性通道，
+            # 缺席=旧行为逐字）；实报注入数供客户端标注宁缺毋滥。
+            answer_args: dict[str, Any] = {}
+            answer_terms = _merged_course_terms(payload)
+            if answer_terms:
+                answer_args["course_terms"] = answer_terms
+                metrics["course_memory_terms"] = len(answer_terms)
             outputs["answer"] = answer_question(
                 api_key,
                 query=str(payload.get("query") or ""),
                 evidence=list(payload.get("evidence") or []),
+                **answer_args,
             )
             metrics["evidence_count"] = len(payload.get("evidence") or [])
+            # AS6/RR-PARK-1 P2：解释/解答的真实消耗随结果上报（纯观测计数，
+            # total=prompt+completion 与 deep_usage 同口径）。drain 恰在本
+            # 分支：字幕深校对已自行收口进 usage_sink，摘要链在其后自
+            # drain，互不重叠；RR-ACCOUNT2-1 起各分支增量聚合，组合任务
+            # （字幕+解答+摘要同单）不再互相覆盖。
+            metrics["deepseek_tokens"] = metrics.get("deepseek_tokens", 0) + sum(
+                max(0, int(record.get("prompt_tokens") or 0))
+                + max(0, int(record.get("completion_tokens") or 0))
+                for record in drain_call_log()
+            )
         if "ocr" in requested:
             outputs["ppt_pages"] = pages
         if slides_skipped:
@@ -695,6 +910,9 @@ def _process_materialized_job(
             if pack_terms:
                 # V4NONTHINK-1 件6：learning_pack 摘要同享术语表注入（含 OCR 词表）。
                 summary_args["glossary"] = pack_terms
+            # RR-ACCOUNT2-1：摘要链（窗口+合并，含失败尝试）统一账本，任务级
+            # metrics 汇总真实 token（纯观测计数）。
+            summary_usage: list[dict[str, Any]] = []
             try:
                 summary = create_summary(
                     api_key,
@@ -703,6 +921,7 @@ def _process_materialized_job(
                     ppt_pages=pages,
                     prior_checkpoint=prior,
                     checkpoint=summary_checkpoint,
+                    usage_sink=summary_usage,
                     **summary_args,
                 )
             except LLMError:
@@ -740,6 +959,14 @@ def _process_materialized_job(
                     },
                     "warnings": warnings,
                 }
+            # RR-ACCOUNT2-1：摘要任务的真实 token 随结果上报（prompt+completion
+            # 与 answer 同口径；增量聚合防组合任务分支互相覆盖）。llm_pending
+            # 降级回执不落远端账——该面由客户端本地完成后按既有绝对值口径记账。
+            metrics["deepseek_tokens"] = metrics.get("deepseek_tokens", 0) + sum(
+                max(0, int(record.get("prompt_tokens") or 0))
+                + max(0, int(record.get("completion_tokens") or 0))
+                for record in summary_usage
+            )
             if "summary" in requested:
                 outputs["summary"] = summary
             if "chapters" in requested:
@@ -817,27 +1044,35 @@ def run() -> int:
 
     def publish_control(kind: str, payload: dict[str, Any], *, mutable: bool = False) -> None:
         nonlocal control_sequence
+        # RR-FIX452-1：序号分配与签名持锁，评论网络 I/O 放锁外——检查点信封
+        # 分件 POST 可达分钟级（≤6 POST/分钟节流），持锁会堵死进度心跳 PATCH。
         with control_lock:
             control_sequence += 1
+            sequence = control_sequence
             value = {
                 "schema": CONTROL_SCHEMA,
                 "protocol_version": PROTOCOL_VERSION,
                 "task_id": job["task_id"],
                 "input_hash": job["input_hash"],
-                "sequence": control_sequence,
+                "sequence": sequence,
                 "control_kind": kind,
                 "created_at": time.time(),
                 "payload": payload,
             }
-            sealed_control = seal_control(
-                value,
-                str(job["result_public_key"]),
-                _required("WORKER_SIGNING_PRIVATE_KEY"),
-            )
-            if mutable:
-                mailbox.publish_status(control_sequence, sealed_control)
-            else:
-                mailbox.publish_control(control_sequence, sealed_control)
+        sealed_control = seal_control(
+            value,
+            str(job["result_public_key"]),
+            _required("WORKER_SIGNING_PRIVATE_KEY"),
+        )
+        if mutable:
+            mailbox.publish_status(sequence, sealed_control)
+        else:
+            mailbox.publish_control(sequence, sealed_control)
+
+    checkpoint_publisher = _CheckpointPublisher(
+        lambda checkpoint_value: publish_control("checkpoint", {"checkpoint": checkpoint_value})
+    )
+    checkpoint_cadence = _CheckpointCadence()
 
     def write_checkpoint(value: dict[str, Any]) -> None:
         checkpoint_result = {
@@ -872,7 +1107,13 @@ def run() -> int:
             encoding="utf-8",
         )
         os.replace(temporary_checkpoint, destination)
-        publish_control("checkpoint", {"checkpoint": value})
+        now = time.monotonic()
+        if checkpoint_cadence.should_publish(value, now):
+            checkpoint_cadence.mark(value, now)
+            # JSON 往返脱钩调用方的可变结构（窗口循环随后继续扩展转录列表）。
+            checkpoint_publisher.submit(json.loads(json.dumps(value)))
+        else:
+            checkpoint_publisher.stats["skipped"] += 1
 
     publisher = SignedProgressPublisher(
         lambda payload: publish_control("progress", payload, mutable=True)
@@ -891,6 +1132,9 @@ def run() -> int:
             error_code = safe_worker_error_detail(exc) or "worker_failed"
         except Exception:
             error_code = "worker_failed"
+        # 失败面不等检查点评论收尾（artifact 逐窗在案，客户端失败路径取
+        # artifact），立即让 failed 状态 PATCH 上行。
+        checkpoint_publisher.close(flush_timeout=0.0)
         publisher.update(
             "remote_compute", status="failed",
             error_code=error_code, force=True,
@@ -911,6 +1155,7 @@ def run() -> int:
         "stage": "result", "status": "completed", "completed": 1,
         "total": 1, "error_code": "",
     }, mutable=True)
+    checkpoint_publisher.close()
     print(f"task={task_id} stage=result_ready", flush=True)
     return 0
 

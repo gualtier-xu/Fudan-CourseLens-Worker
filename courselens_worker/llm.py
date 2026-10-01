@@ -479,11 +479,14 @@ def proofread_segments(
     checkpoint: Callable[[dict[str, Any]], None] | None = None,
     ppt_pages: list[dict[str, Any]] | None = None,
     glossary: tuple[str, ...] = (),
+    usage_sink: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Bounded word-level correction of ``primary`` against alternates.
 
     AS12：交替源不限于 sensevoice 粗识别——平台原生文稿命中 platform-first
     时同样从这个槽位进入；来源只影响参考文本，不改变任何 fail-closed 约束。
+    ``usage_sink``（RR-ACCOUNT2-1）非 None 时每成功窗后收走全局调用流水
+    （与 term 链同法），供调用方把词级校对的真实 token 落进任务账。
     """
     primaries = normalize_segments(primary)
     alternates = normalize_segments(rough_alternates)
@@ -539,7 +542,12 @@ def proofread_segments(
         last_error: LLMError | None = None
         for attempt in range(_PROOFREAD_WINDOW_ATTEMPTS):
             try:
-                return _json_content(_chat(api_key, messages))
+                value = _json_content(_chat(api_key, messages))
+                if usage_sink is not None:
+                    # RR-ACCOUNT2-1：成功窗立即收账（并发双窗同锁清账，合计
+                    # 不重不漏；与 term 链 drain 同法）。
+                    usage_sink.extend(drain_call_log())
+                return value
             except LLMError as exc:
                 last_error = exc
                 if attempt + 1 < _PROOFREAD_WINDOW_ATTEMPTS:
@@ -1413,6 +1421,38 @@ _SUMMARY_EVIDENCE_WINDOW_PROMPT = (
 )
 
 
+# RR-QWIN-1 Q1（AI-RESEARCH-1 P1）：takeaway 时间戳锚本地派生——零提示词
+# 零新调用（merge 提示词顶在 ≤300 防膨胀钉上，指令通道走不通）。候选文本池
+# =合法 chapters（title+summary，start_ms 已过白名单）+ 原始字幕段；字符
+# 二元组 Dice 相似度取最优，低于阈值宁可无锚（fail-closed：锚错比锚缺更
+# 伤「AI 说的话可信吗」的信任闭环）。
+_TAKEAWAY_ANCHOR_MIN_SCORE = 0.22
+
+
+def _anchor_char_bigrams(text: str) -> set[str]:
+    cleaned = "".join(ch for ch in str(text or "").lower() if ch.isalnum())
+    return {cleaned[index:index + 2] for index in range(len(cleaned) - 1)}
+
+
+def _takeaway_anchor_ms(text: str, candidates: list[tuple[int, str]]) -> int | None:
+    grams = _anchor_char_bigrams(text)
+    if not grams:
+        return None
+    best_ms: int | None = None
+    best_score = 0.0
+    for start_ms, candidate_text in candidates:
+        candidate_grams = _anchor_char_bigrams(candidate_text)
+        if not candidate_grams:
+            continue
+        score = 2.0 * len(grams & candidate_grams) / (len(grams) + len(candidate_grams))
+        if score > best_score:
+            best_score = score
+            best_ms = int(start_ms)
+    if best_score < _TAKEAWAY_ANCHOR_MIN_SCORE:
+        return None
+    return best_ms
+
+
 def create_summary(
     api_key: str,
     *,
@@ -1666,6 +1706,17 @@ def create_summary(
             text = str(item or "").strip()[:60]
             if text:
                 takeaways.append(text)
+    # RR-QWIN-1 Q1：takeaway 逐条时间戳锚，与 key_takeaways 等长对齐。锚值
+    # 只取 valid_anchors 白名单（chapters 已过校验、字幕段 start_ms 天然合
+    # 法）；None=没有足够把握，客户端不渲染锚而非报错。
+    anchor_candidates = [
+        (int(item["start_ms"]), f"{item.get('title') or ''} {item.get('summary') or ''}")
+        for item in chapters
+    ]
+    anchor_candidates.extend(
+        (int(item.get("start_ms") or 0), str(item.get("text") or "")) for item in transcript
+    )
+    takeaway_anchors = [_takeaway_anchor_ms(text, anchor_candidates) for text in takeaways]
     # 多源知识：只有引用了包内 citation 的知识点才会落地；坏引用整条丢弃。
     citations = dict(packet.get("citations") or {}) if packet is not None else {}
     knowledge_points, point_meta = validate_knowledge_points(
@@ -1690,7 +1741,9 @@ def create_summary(
         f"stage=summary windows={len(sources)}/{len(sources)} "
         f"resumed={completed} evidence_windows={len(evidence_windows)} "
         f"events={len(events)} events_rejected={rejected} "
-        f"takeaways={len(takeaways)} knowledge_points={len(knowledge_points)} "
+        f"takeaways={len(takeaways)} "
+        f"takeaway_anchors={sum(1 for item in takeaway_anchors if item is not None)} "
+        f"knowledge_points={len(knowledge_points)} "
         f"citations_rejected={int(point_meta.get('rejected') or 0)} "
         f"thinking={deep_usage['thinking']} window_retries={window_retries} "
         f"window_skipped={window_skipped} merge_retries={merge_retries} "
@@ -1705,6 +1758,10 @@ def create_summary(
         "assessment_events": events,
         "assessment_events_rejected": rejected,
         "key_takeaways": takeaways,
+        # RR-QWIN-1 Q1：与 key_takeaways 等长对齐的时间戳锚（int 毫秒或
+        # None）。加性字段：既有消费方（key_takeaways 逐条 str()）不受影响，
+        # 未知字段按「未知字段忽略」降级纪律处理。
+        "takeaway_anchors": takeaway_anchors,
         "knowledge_points": knowledge_points,
         "topic_candidates": topics,
         "source_coverage": (
@@ -1719,17 +1776,111 @@ def create_summary(
     }
 
 
+# ---- RR-P5HARD-1：answer_question 本体加固（SUMMARY-FIX-1/6fbd077 同族） ----
+# 提问链三点裸奔（对齐总结链已钉范式）：①无 thinking=提供商默认 enabled/high，
+# 思考推理计入 max_tokens 顶穿 8192 帽 → content 空/合法 JSON 空 answer；
+# ②空返回无抢救直接抛；③坏形状无 stage 级重试，一瞬态坏响应即 llm_pending
+# 整单降级。缺省关思考（与 SUMMARY_THINKING 同判同闭集）；system 串逐位不动
+# （零提示词膨胀，299/300 防膨胀钉同纪律）。
+QUESTION_THINKING_ENV = "COURSELENS_QUESTION_THINKING"
+QUESTION_THINKING: dict[str, str] | None = {"type": "disabled"}
+_QUESTION_MAX_TOKENS = 8192             # 非思考档输出帽（既有合同，测试钉 8192）
+_QUESTION_THINKING_MAX_TOKENS = 16384   # 思考档输出帽（推理计入 max_tokens）
+_QUESTION_ATTEMPTS = 2                  # 瞬态失败重试恰一次，再败 fail-closed
+_QUESTION_RETRY_BACKOFF_SECONDS = 1.0
+# 6fbd077 家规：429 限流与授权/setup 类绝不入 stage 级重试集——传输层已按
+# Retry-After 有界退避过，stage 级再试=hammer 限流器；401/403 重试无意义。
+_ANSWER_NO_RETRY_STATUSES = frozenset({401, 403, 429})
+
+
+def _resolve_question_thinking() -> dict[str, str] | None:
+    raw = os.environ.get(QUESTION_THINKING_ENV, "").strip().lower()
+    if not raw:
+        return QUESTION_THINKING
+    if raw in {"default", "provider-default"}:
+        return None
+    if raw == "disabled":
+        return {"type": "disabled"}
+    if raw in {"low", "high", "max"}:
+        return {"type": "enabled", "reasoning_effort": raw}
+    return QUESTION_THINKING
+
+
+def _salvage_answer_object(text: str) -> dict[str, Any] | None:
+    """Recover an answer object from a chatty or truncated reply.
+
+    RR-P5HARD-1 对象版抢救（_salvage_summary_object 同族）：①整体花括号切片
+    解析（chatty 前后缀）；②截断响应按 answer 键回收正文（citations 缺席=
+    合法空表，grounding 门自然拒绝——宁缺勿假，绝不凭空补引用）。两级都空
+    返回 None，由调用方计入重试。
+    """
+    value = str(text or "").strip()
+    if value.startswith("```"):
+        value = value.split("\n", 1)[-1].rsplit("```", 1)[0]
+    start = value.find("{")
+    end = value.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(value[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    match = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"', value)
+    if match:
+        try:
+            answer = json.loads(f'"{match.group(1)}"')
+        except json.JSONDecodeError:
+            return None
+        if str(answer).strip():
+            return {"answer": str(answer), "grounded": False, "citations": []}
+    return None
+
+
+def _valid_answer_object(value: Any) -> bool:
+    """SUMFIX-2 空串纪律：合法 JSON 但 answer 空串（C2 实锤同形）按失败处理。"""
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("answer"), str)
+        and bool(value["answer"].strip())
+        and isinstance(value.get("citations"), list)
+    )
+
+
+def _answer_status_no_retry(exc: Exception) -> bool:
+    match = re.fullmatch(r"AI request returned HTTP (\d{3})", str(exc))
+    return bool(match) and int(match.group(1)) in _ANSWER_NO_RETRY_STATUSES
+
+
 def answer_question(
     api_key: str,
     *,
     query: str,
     evidence: list[dict[str, Any]],
+    course_terms: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Answer only from caller-provided evidence and preserve citation IDs."""
+    """Answer only from caller-provided evidence and preserve citation IDs.
+
+    ``course_terms``（RR-P6MEM-1）可选：客户端课程记忆术语表的数据通道——
+    只随 user 消息 JSON 加性出现，system 提示词零膨胀（299/300 防膨胀钉
+    原样保持）；缺省空元组时本函数行为与历史上逐字相同。
+    """
     allowed = [item for item in evidence if isinstance(item, dict) and item.get("citation_id") and item.get("text")]
     if not allowed:
         return {"answer": "资料不足，无法根据当前课程资料回答。", "citations": [], "grounded": False}
-    raw = _json_content(_chat(api_key, [
+    # RR-P5HARD-1：思考档显式决策（缺省 disabled，env 闭集覆写）；思考档下
+    # 输出帽放大（推理计入 max_tokens，与总结链窗口帽同判）。
+    tier = _resolve_question_thinking()
+    max_tokens = (
+        _QUESTION_MAX_TOKENS
+        if (tier or {}).get("type") == "disabled"
+        else _QUESTION_THINKING_MAX_TOKENS
+    )
+    terms = [str(term).strip() for term in (course_terms or ()) if str(term).strip()]
+    question_input: dict[str, Any] = {"query": str(query), "evidence": allowed}
+    if terms:
+        question_input["course_terms"] = terms
+    messages = [
         {
             "role": "system",
             "content": (
@@ -1740,13 +1891,37 @@ def answer_question(
                 "证据不足时 answer 必须为‘资料不足，无法根据当前课程资料回答。’，grounded 为 false。"
             ),
         },
-        {"role": "user", "content": json.dumps({"query": str(query), "evidence": allowed}, ensure_ascii=False)},
-    ], max_tokens=8192))
-    if not isinstance(raw, dict) or not isinstance(raw.get("answer"), str) or not isinstance(raw.get("citations"), list):
-        raise LLMError("answer response has an invalid shape")
+        {"role": "user", "content": json.dumps(question_input, ensure_ascii=False)},
+    ]
+    value: Any = None
+    last_error: LLMError | None = None
+    for attempt in range(_QUESTION_ATTEMPTS):
+        try:
+            raw = _chat(api_key, messages, max_tokens=max_tokens, thinking=tier)
+        except LLMError as exc:
+            # 429 限流/授权类绝不入重试集（6fbd077 家规）：传输层已按
+            # Retry-After 有界退避过，stage 级再试=hammer 限流器。
+            if _answer_status_no_retry(exc):
+                raise
+            last_error = exc
+        else:
+            try:
+                value = _json_content(raw)
+            except LLMError:
+                value = _salvage_answer_object(raw)
+            if _valid_answer_object(value):
+                break
+            last_error = LLMError("answer response has an invalid shape")
+        if attempt + 1 < _QUESTION_ATTEMPTS:
+            _emit_telemetry(f"stage=answer-retry attempt={attempt + 1}")
+            time.sleep(_QUESTION_RETRY_BACKOFF_SECONDS)
+    if not _valid_answer_object(value):
+        raise last_error if last_error is not None else LLMError(
+            "answer response has an invalid shape"
+        )
     allowed_ids = {str(item["citation_id"]) for item in allowed}
-    citations = [str(value) for value in raw["citations"] if str(value) in allowed_ids]
-    grounded = bool(raw.get("grounded")) and bool(citations)
+    citations = [str(item) for item in value["citations"] if str(item) in allowed_ids]
+    grounded = bool(value.get("grounded")) and bool(citations)
     if not grounded:
         return {"answer": "资料不足，无法根据当前课程资料回答。", "citations": [], "grounded": False}
-    return {"answer": raw["answer"].strip(), "citations": citations[:8], "grounded": True}
+    return {"answer": value["answer"].strip(), "citations": citations[:8], "grounded": True}
