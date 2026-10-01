@@ -8,7 +8,10 @@ _chat 的每次调用 usage 流水从未进 metrics。本钉锁住「answer 分�
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from courselens_worker import llm as llm_mod
@@ -100,6 +103,65 @@ class AnswerCourseTermsPassthroughTests(unittest.TestCase):
         result, captured = self._run({})
         self.assertNotIn("course_memory_terms", result["metrics"])
         self.assertNotIn("course_terms", json.loads(captured[0][1]["content"]))
+
+
+class EnvGlossaryReportingTests(unittest.TestCase):
+    """QA-SWEEP-1 P1-6：实报注入数只数课程记忆本源，env 词单独计数。
+
+    并集口径会让 env 术语文件词冒充「本回答已应用课程记忆 N 条」的学生
+    可见标注（虚报）；注入面行为不变（LLM 仍收并集），只是两个来源分开
+    如实报数——宁缺毋滥。
+    """
+
+    def _run(self, payload_extra: dict, env_terms: str = "") -> tuple[dict, list[dict]]:
+        captured: list[dict] = []
+
+        def _fake_chat(api_key, messages, **kwargs):
+            captured.append(messages)
+            return json.dumps(
+                {"answer": "回答", "grounded": True, "citations": ["r1"]},
+                ensure_ascii=False,
+            )
+
+        with tempfile.TemporaryDirectory() as scratch:
+            env: dict[str, str] = {}
+            if env_terms:
+                env_path = Path(scratch) / "terms.txt"
+                env_path.write_text(env_terms, encoding="utf-8")
+                env["COURSELENS_TERM_GLOSSARY_FILE"] = str(env_path)
+            with patch.dict(os.environ, env, clear=False):
+                if not env_terms:
+                    # patch.dict 出口按入口快照恢复：宿主机若带此变量，仅本用例内隔离
+                    os.environ.pop("COURSELENS_TERM_GLOSSARY_FILE", None)
+                job = _answer_job()
+                job["payload"].update(payload_extra)
+                with patch("courselens_worker.llm._chat", side_effect=_fake_chat):
+                    result = process_job(job)
+        return result, captured
+
+    def test_env_terms_are_counted_separately_from_memory(self) -> None:
+        result, captured = self._run(
+            {"glossary": ["费米能级"]}, env_terms="热力学\n熵增\n"
+        )
+        self.assertEqual(result["metrics"]["course_memory_terms"], 1)
+        self.assertEqual(result["metrics"]["env_glossary_terms"], 2)
+        # 注入面不变：LLM 仍收并集（payload 在前，env 补后，去重保序）
+        self.assertEqual(
+            json.loads(captured[0][1]["content"])["course_terms"],
+            ["费米能级", "热力学", "熵增"],
+        )
+
+    def test_env_only_glossary_reports_no_memory_metric(self) -> None:
+        # 只有 env 词表：课程记忆计数缺席（客户端零标注——env 词不是课程
+        # 记忆），env 词单独入账。
+        result, _captured = self._run({}, env_terms="热力学\n熵增\n")
+        self.assertNotIn("course_memory_terms", result["metrics"])
+        self.assertEqual(result["metrics"]["env_glossary_terms"], 2)
+
+    def test_without_env_file_no_env_metric(self) -> None:
+        result, _captured = self._run({"glossary": ["费米能级"]})
+        self.assertEqual(result["metrics"]["course_memory_terms"], 1)
+        self.assertNotIn("env_glossary_terms", result["metrics"])
 
 
 if __name__ == "__main__":

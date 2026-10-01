@@ -120,6 +120,23 @@ def _merged_course_terms(
     ))
 
 
+def _payload_memory_terms(payload: dict[str, Any]) -> tuple[str, ...]:
+    """payload ``glossary`` 本源术语（课程记忆注入数的事实源；去空去重保序）。"""
+    raw = payload.get("glossary")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(dict.fromkeys(
+        str(term).strip() for term in raw if str(term).strip()
+    ))
+
+
+def _env_glossary_terms() -> tuple[str, ...]:
+    """env 术语文件本源词（与课程记忆分源计数，绝不冒充记忆注入）。"""
+    from .glossary import resolve_course_terms
+
+    return resolve_course_terms({})
+
+
 def _apply_term_stage(
     value: dict[str, Any],
     *,
@@ -640,11 +657,19 @@ def _process_materialized_job(
             summary_args["evidence_packet"] = packet
         if payload.get("course_context") is not None:
             summary_args["course_context"] = payload.get("course_context")
-        if _merged_course_terms(payload):
+        glossary = _merged_course_terms(payload)
+        if glossary:
             # V4NONTHINK-1 件6：摘要窗口/合并输入携带课程术语表（笔记写法保险）。
-            summary_args["glossary"] = _merged_course_terms(payload)
-            # RR-P6MEM-1：实报注入数（客户端据此加学生可见记忆标注）。
-            metrics["course_memory_terms"] = len(summary_args["glossary"])
+            summary_args["glossary"] = glossary
+        # RR-P6MEM-1 + QA-SWEEP-1 P1-6：实报只数课程记忆注入（payload glossary
+        # 本源）；env 术语文件词单独计数——并集口径会让 env 词冒充「已应用
+        # 课程记忆 N 条」的学生可见标注，宁缺毋滥。
+        memory_terms = _payload_memory_terms(payload)
+        if memory_terms:
+            metrics["course_memory_terms"] = len(memory_terms)
+        env_terms = _env_glossary_terms()
+        if env_terms:
+            metrics["env_glossary_terms"] = len(env_terms)
         # RR-ACCOUNT2-1：摘要链（窗口+合并，含失败尝试）统一账本，任务级
         # metrics 汇总真实 token（纯观测计数）。
         summary_usage: list[dict[str, Any]] = []
@@ -851,7 +876,14 @@ def _process_materialized_job(
             answer_terms = _merged_course_terms(payload)
             if answer_terms:
                 answer_args["course_terms"] = answer_terms
-                metrics["course_memory_terms"] = len(answer_terms)
+            # QA-SWEEP-1 P1-6：同摘要面——实报只数课程记忆本源（payload
+            # glossary），env 术语文件词单独计数，不让并集冒充记忆注入数。
+            memory_terms = _payload_memory_terms(payload)
+            if memory_terms:
+                metrics["course_memory_terms"] = len(memory_terms)
+            env_terms = _env_glossary_terms()
+            if env_terms:
+                metrics["env_glossary_terms"] = len(env_terms)
             outputs["answer"] = answer_question(
                 api_key,
                 query=str(payload.get("query") or ""),
