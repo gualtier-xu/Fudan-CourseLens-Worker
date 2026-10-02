@@ -1,6 +1,6 @@
 {
   "exporter": {
-    "allowlist_sha256": "b82214e24f6d1657926dfbbe02639258d8e422e57b1ac4e9a0494634a6d0cd45",
+    "allowlist_sha256": "b636b1f88b08db97d036e385e35a5b2bccab3cd7b6224910c3e70cda0e569e38",
     "version": "1.0.0"
   },
   "payload": {
@@ -104,8 +104,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/asr.py",
-        "sha256": "f91c29a245cb98c1f1b92cb5af86dd9d093bd2cc394b0cc53fa8d4206f87967d",
-        "size": 73662
+        "sha256": "119b7045760f6f4279231d6fd7769e094f00dce2bb4a3b4db2179722a44e227e",
+        "size": 76439
       },
       {
         "mode": "100644",
@@ -182,8 +182,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/runner.py",
-        "sha256": "aec09f380e9f33d87d14063baa9ac413a2bd9c438e629cf940013c190037e205",
-        "size": 55866
+        "sha256": "befa84cfc673372574a05ebdaa8e11ad81c1b143f287d78ce2a5ce043a553329",
+        "size": 55943
       },
       {
         "mode": "100644",
@@ -314,8 +314,8 @@
       {
         "mode": "100644",
         "path": "tests/test_asr.py",
-        "sha256": "5a5180a04731b06df4b9c0c3027d6a7a07f64622acb95fffc966937a47464a21",
-        "size": 20803
+        "sha256": "d5a7f48887f6c9d862ddd392222febc7a684a5d725cfd238587b6cdb7b2e2e4a",
+        "size": 20863
       },
       {
         "mode": "100644",
@@ -400,6 +400,12 @@
         "path": "tests/test_mailbox.py",
         "sha256": "f311c67cdd17ea3b0afa46e6a41931ba0f342a75ab2fbe799c4d614b8c401152",
         "size": 11910
+      },
+      {
+        "mode": "100644",
+        "path": "tests/test_media_prefetch_integrity.py",
+        "sha256": "a7a28c1aac83def78a6da9e7864d0c55377a5aa206105e1e1d0e33326d32ee4c",
+        "size": 14700
       },
       {
         "mode": "100644",
@@ -540,8 +546,8 @@
         "size": 10522
       }
     ],
-    "git_tree": "a14c8baa44bd72aa540da9ed450714da83493ea3",
-    "tree_sha256": "3b1a61bdaa526f73b86945e9969f36119f7cc9bc2db8a69199c8934e7856f235"
+    "git_tree": "780ada2c83be1edfafdfe169851015584755b91a",
+    "tree_sha256": "eb04887838c4d5498dee0fb91e78bd1f55ba81ed760c25295d90a6baeaca2051"
   },
   "protocol": {
     "supported_versions": [
@@ -550,8 +556,8 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "3a3542c5e5aa15e12157c3d030e933d8d21a7957",
+    "commit": "225487aa723597643978b955da199e2863664bbc",
     "repository": "Fudan-CourseLens-Private",
-    "worker_tree": "e24c835ec2b5cde40e9c13ce9513d4f01cdd2a00"
+    "worker_tree": "afa1618195ffa6bcfa461a4f978ea9c570f775da"
   }
 }

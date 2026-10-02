@@ -45,6 +45,7 @@ _ASR_ERROR_CODES = {
     "checkpoint subtitle mode does not match the job": "checkpoint_mode_mismatch",
     "authorized media decode timed out": "media_decode_timeout",
     "ffmpeg could not decode the authorized media stream": "media_decode_failed",
+    "authorized media prefetch was incomplete": "media_prefetch_incomplete",
     "authorized media request returned HTTP 401": "media_http_401",
     "authorized media request returned HTTP 403": "media_http_403",
     "authorized media request returned HTTP 404": "media_http_404",

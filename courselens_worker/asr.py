@@ -708,6 +708,14 @@ _MEDIA_RETRY_MESSAGES = frozenset({
     "authorized media request returned HTTP 5xx",
 })
 
+# MEDIA-FIX-PREFETCH-1（2026-10-02 452282 定因）：上游提前断流时，代理转发
+# 循环对 read(amt) 的静默空串收尾无从分辨、ffmpeg 对传输层提前 EOF 按正常
+# 输入结束 exit 0（stderr 的 demuxing I/O error 在成功路径不可见），截断 PCM
+# 由此静默过关，迟至空切片才以错位的 decode 码上行。完整性门=期望 PCM 字节
+# （时长×采样率×4，1s 容差吸收容器时长元数据与实际解码样本的常规毫秒级偏差）
+# fail-closed；分块短块/空切片同码归真，不再错标 decode 失败。
+_MEDIA_PREFETCH_INCOMPLETE_MESSAGE = "authorized media prefetch was incomplete"
+
 # P55（第五十五案）：块边界授权刷新此前裸奔——真机事故 2026-09-24：粗腿与前两
 # 块正常，chunk 2 边界 refresh 抛 platform_auth_context_missing 整单即死，且死在
 # decode-start 遥测之前（死窗无痕）。边界刷新与块内媒体重取同族：同量退避梯
@@ -718,8 +726,18 @@ _SOURCE_REFRESH_ATTEMPTS = len(_MEDIA_RETRY_BACKOFF_SECONDS) + 1
 _SOURCE_REFRESH_RETRY_CODES = frozenset(_RETRYABLE_LOGIN_ERRORS | _RETRYABLE_SESSION_ERRORS)
 
 
-def _refresh_media_authorization(proxy: Any, *, chunk: int, elapsed: Callable[[], int]) -> None:
-    """Bounded refresh ladder for one chunk-boundary authorization refresh."""
+def _refresh_media_authorization(
+    proxy: Any,
+    *,
+    chunk: int,
+    elapsed: Callable[[], int],
+    label: str | None = None,
+) -> None:
+    """Bounded refresh ladder for one chunk-boundary authorization refresh.
+
+    ``label`` rebrands the telemetry face for non-chunk callers (the prefetch
+    refetch path) without changing the chunk-boundary semantics.
+    """
     for attempt in range(_SOURCE_REFRESH_ATTEMPTS):
         try:
             proxy.refresh_source()
@@ -728,9 +746,10 @@ def _refresh_media_authorization(proxy: Any, *, chunk: int, elapsed: Callable[[]
             if str(exc) not in _SOURCE_REFRESH_RETRY_CODES:
                 raise
             failed = attempt == _SOURCE_REFRESH_ATTEMPTS - 1
+            face = label if label is not None else f"chunk={chunk}"
             _emit_telemetry(
                 f"stage=source-refresh-{'failed' if failed else 'retry'} "
-                f"chunk={chunk} attempt={attempt + 1} reason={exc} elapsed={elapsed()}"
+                f"{face} attempt={attempt + 1} reason={exc} elapsed={elapsed()}"
             )
             if failed:
                 raise
@@ -772,6 +791,14 @@ def _prefetch_media_pcm(
     if returncode != 0 or not target.is_file() or target.stat().st_size == 0:
         target.unlink(missing_ok=True)
         raise _decode_failure(ffmpeg_stderr.decode("utf-8", errors="replace"))
+    # 完整性门（MEDIA-FIX-PREFETCH-1）：ffmpeg 对提前 EOF exit 0，期望字节
+    # 门是截断的唯一守卫——低于期望量减 1s 容差即按新闭集码如实失败，绝不
+    # 放行截断文件去烧后续分块 ASR。
+    expected_bytes = int(round(duration * SAMPLE_RATE)) * _PCM_SAMPLE_BYTES
+    minimum_bytes = expected_bytes - SAMPLE_RATE * _PCM_SAMPLE_BYTES
+    if target.stat().st_size < minimum_bytes:
+        target.unlink(missing_ok=True)
+        raise ASRError(_MEDIA_PREFETCH_INCOMPLETE_MESSAGE)
 
 
 _PCM_SAMPLE_BYTES = 4  # f32le
@@ -787,8 +814,10 @@ def _slice_pcm_chunk(
     """夜10-C 第七波①：从预取全量 PCM 按字节切片一个分块（纯本地 I/O）。
 
     字节地址 = 秒 × SAMPLE_RATE × 4（f32le）；越界尾部按实际剩余字节截断
-    （与解码越界的截断行为一致）。切片为空且请求时长为正 = 预取不足，
-    按既有闭集媒体码如实失败。
+    （与解码越界的截断行为一致）。MEDIA-FIX-PREFETCH-1：满块/尾块请求长度
+    本身精确，短于请求量减 1s 容差只可能来自预取截断——短块与空切片
+    （452282 chunk7 形状）都按真实根因 media_prefetch_incomplete 上行，
+    绝不静默空段、不再错标 decode 失败。
     """
     start = int(max(0.0, offset) * SAMPLE_RATE) * _PCM_SAMPLE_BYTES
     length = int(max(0.0, duration) * SAMPLE_RATE) * _PCM_SAMPLE_BYTES
@@ -805,9 +834,11 @@ def _slice_pcm_chunk(
     except OSError:
         target.unlink(missing_ok=True)
         raise ASRError("authorized media upstream connection failed")
-    if duration > 0 and written == 0:
+    if duration > 0 and (
+        written == 0 or written < length - SAMPLE_RATE * _PCM_SAMPLE_BYTES
+    ):
         target.unlink(missing_ok=True)
-        raise ASRError("ffmpeg could not decode the authorized media stream")
+        raise ASRError(_MEDIA_PREFETCH_INCOMPLETE_MESSAGE)
 
 
 # ---- 夜10-C 第九波任务1：邻接重复折叠（口齿不清的 ASR 连续重复字词） ----
@@ -1472,9 +1503,29 @@ def transcribe(
             full_pcm = root / "media-full.f32le"
             prefetch_started = time.monotonic()
             _emit_telemetry(f"stage=media-prefetch-start elapsed={_elapsed_ticks()}")
-            _prefetch_media_pcm(proxy.url, full_pcm, duration=duration)
+            # MEDIA-FIX-PREFETCH-1：完整性门判为截断时有界重取一次——退避后
+            # 先 refresh_source 换新签名 URL（同一性守卫沿用代理面），再走同
+            # 一条预取命令；梯尽按 media_prefetch_incomplete 如实失败。
+            try:
+                _prefetch_media_pcm(proxy.url, full_pcm, duration=duration)
+            except ASRError as exc:
+                if str(exc) != _MEDIA_PREFETCH_INCOMPLETE_MESSAGE:
+                    raise
+                _emit_telemetry(
+                    "stage=media-prefetch-retry attempt=1 "
+                    f"reason=media_prefetch_incomplete elapsed={_elapsed_ticks()}"
+                )
+                time.sleep(_MEDIA_RETRY_BACKOFF_SECONDS[0])
+                _refresh_media_authorization(
+                    proxy,
+                    chunk=completed_chunks,
+                    elapsed=_elapsed_ticks(),
+                    label="face=prefetch",
+                )
+                _prefetch_media_pcm(proxy.url, full_pcm, duration=duration)
             _emit_telemetry(
                 f"stage=media-prefetch-done bytes={full_pcm.stat().st_size} "
+                f"expected={int(round(duration * SAMPLE_RATE)) * _PCM_SAMPLE_BYTES} "
                 f"seconds={round(time.monotonic() - prefetch_started, 3)} "
                 f"elapsed={_elapsed_ticks()}"
             )
