@@ -146,8 +146,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/llm.py",
-        "sha256": "b704f397611390ed1c46da4a861b5dff3bf41397539c79e3913911d2640a33bc",
-        "size": 122904
+        "sha256": "fbfd1a11b8571435f6660891b8ff9f9d8a256275b73b579ecfabbbede3999575",
+        "size": 123179
       },
       {
         "mode": "100644",
@@ -206,8 +206,8 @@
       {
         "mode": "100644",
         "path": "requirements.txt",
-        "sha256": "6219266f1984ab87e91c0c9ff438b33be53ac338e407e61c6ff81848384b2d69",
-        "size": 164
+        "sha256": "d130d11a33bd49607d918458e1b65f70788e75472e666ade44859b821155ca25",
+        "size": 183
       },
       {
         "mode": "100644",
@@ -546,8 +546,8 @@
         "size": 10522
       }
     ],
-    "git_tree": "780ada2c83be1edfafdfe169851015584755b91a",
-    "tree_sha256": "eb04887838c4d5498dee0fb91e78bd1f55ba81ed760c25295d90a6baeaca2051"
+    "git_tree": "ad664d570fe1460b0135b8d904b8f2b13009af31",
+    "tree_sha256": "d2895654994335d2efbc43f0585e7f8cce43228f74aba62d39d193ec2d84fbd5"
   },
   "protocol": {
     "supported_versions": [
@@ -556,8 +556,8 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "225487aa723597643978b955da199e2863664bbc",
+    "commit": "5c6898d6fec0752cfb2f55be6b2de1a3c20896f5",
     "repository": "Fudan-CourseLens-Private",
-    "worker_tree": "afa1618195ffa6bcfa461a4f978ea9c570f775da"
+    "worker_tree": "375add39ec5e57bd4f598bc1a78a95cd82c809a4"
   }
 }
