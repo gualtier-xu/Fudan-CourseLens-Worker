@@ -297,7 +297,8 @@ class MediaPrefetchPins(unittest.TestCase):
                          "预取期失败不触发任何块界刷新（一次性授权边界）")
 
     def test_slice_pcm_chunk_zero_byte_mid_media_fails_closed(self):
-        # 预取截断（中段切片为空且请求时长为正）→ 闭集媒体码，绝不静默空段
+        # 预取截断（中段切片为空且请求时长为正）→ 真实根因闭集码
+        # media_prefetch_incomplete，绝不静默空段、不再错标 decode 失败
         with tempfile.TemporaryDirectory() as folder:
             full = Path(folder) / "full.f32le"
             full.write_bytes(b"")
@@ -306,7 +307,7 @@ class MediaPrefetchPins(unittest.TestCase):
                 asr._slice_pcm_chunk(full, target, offset=600.0, duration=600.0)
             self.assertEqual(
                 str(caught.exception),
-                "ffmpeg could not decode the authorized media stream",
+                "authorized media prefetch was incomplete",
             )
             self.assertFalse(target.exists())
 
