@@ -38,6 +38,9 @@ jobs:
       COURSELENS_ASR_STRATEGY: ${{ vars.COURSELENS_ASR_STRATEGY || 'sequential' }}
       COURSELENS_OCR_CONCURRENCY: ${{ vars.COURSELENS_OCR_CONCURRENCY || '1' }}
       COURSELENS_IMAGE_PREFETCH: ${{ vars.COURSELENS_IMAGE_PREFETCH || '16' }}
+      # THINK-LADDER-1 Phase 2：质量抽检思考档（用户 2026-10-02 拍板「适当少量
+      # 使用」→ 缺省 low；执行仓 Variables 可调，worker llm.py 闭集解析）。
+      COURSELENS_JUDGE_THINKING: ${{ vars.COURSELENS_JUDGE_THINKING || 'low' }}
       OMP_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
       OPENBLAS_NUM_THREADS: "1"
