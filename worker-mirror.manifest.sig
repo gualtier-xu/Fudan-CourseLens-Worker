@@ -1,7 +1,7 @@
 {
   "algorithm": "ed25519",
   "key_id": "release-2026-09-cleanroom-r3",
-  "payload_sha256": "8bdd048c26f51610934836c45896d69c010f782d28005fc97e9de92cde64fd57",
+  "payload_sha256": "4aa2fd53af7ba3b437b2a5fe6238d86eaf9f3d2389254240c1ad4b06ff28eb3d",
   "schema": "courselens.worker-mirror.signature.v1",
-  "signature": "/qpIxZap1OJqra4BpTzb163cEKU0w3RthSpOws/vVzLvso2ydPWZbxrd4FEZ3KoCXLofmIw2hEu8dzY6ErjuDw=="
+  "signature": "HGoFzy4XlHoF2XGqbtUcE3G5MvRSAzgpoiPkcYrbuZx2pU3XiTZuuUuU3h3h7ZtoG1C81hwTTGxs9lKev/yBAA=="
 }
