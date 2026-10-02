@@ -9,7 +9,7 @@ import os
 import re
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -35,18 +35,27 @@ _USAGE = {
     "reasoning_tokens": 0, "prompt_cache_hit_tokens": 0,
 }
 # 每调用 usage 流水（仅计数与档位，零内容）；调用方 drain 后自行聚合。
-_CALL_LOG: list[dict[str, Any]] = []
+# R3-08：deque(maxlen) 取代「满后覆写末位」——真 FIFO 语义（最近 512 次），
+# drain 消费方（runner 全量倒账）零影响。
 _CALL_LOG_LIMIT = 512
+_CALL_LOG: deque = deque(maxlen=_CALL_LOG_LIMIT)
 
 
 class LLMError(RuntimeError):
-    pass
+    """传输/形状失败；``status`` 为可选 HTTP 状态通道（R3-07）。
+
+    下游 no-retry 判定优先读 ``status``；message 文本格式保持不变，
+    正则解析保留一个版本作旧调用方兼容回退。"""
+
+    def __init__(self, message: str, *, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 def drain_call_log() -> list[dict[str, Any]]:
     """Return and clear the per-call usage log (counters only, no content)."""
     with _USAGE_LOCK:
-        drained = _CALL_LOG[:]
+        drained = list(_CALL_LOG)
         _CALL_LOG.clear()
         return drained
 
@@ -120,10 +129,7 @@ def _chat(
                         _USAGE[key] += max(0, int(usage.get(key) or 0))
                     _USAGE["reasoning_tokens"] += record["reasoning_tokens"]
                     _USAGE["prompt_cache_hit_tokens"] += record["prompt_cache_hit_tokens"]
-                    if len(_CALL_LOG) < _CALL_LOG_LIMIT:
-                        _CALL_LOG.append(record)
-                    else:
-                        _CALL_LOG[-1] = record
+                    _CALL_LOG.append(record)
                 return str(value["choices"][0]["message"]["content"])
             except (ValueError, KeyError, IndexError, TypeError) as exc:
                 raise LLMError("AI response shape is invalid") from exc
@@ -135,7 +141,7 @@ def _chat(
         except ValueError:
             delay = float(2 ** attempt)
         time.sleep(delay)
-    raise LLMError(f"AI request returned HTTP {last_status or 'unknown'}")
+    raise LLMError(f"AI request returned HTTP {last_status or 'unknown'}", status=last_status or None)
 
 
 def _json_content(text: str) -> Any:
@@ -632,17 +638,26 @@ TERM_THINKING: dict[str, str] | None = {"type": "disabled"}
 _TERM_WINDOW_MAX_TOKENS = 8192
 
 
-def _resolve_term_thinking() -> dict[str, str] | None:
-    raw = os.environ.get(TERM_THINKING_ENV, "").strip().lower()
+def _resolve_thinking(env_name: str, default: dict[str, str] | None) -> dict[str, str] | None:
+    """共享思考档解析闭集（R3-06 收敛；与四个原实现逐键等值）。
+
+    default|provider-default → None（提供商默认 enabled/high）；disabled →
+    {"type":"disabled"}；low|high|max → enabled+reasoning_effort；缺席/未知
+    → 调用方缺省（各链独立引入理据见各自常量注记，R3-16 对照表）。"""
+    raw = os.environ.get(env_name, "").strip().lower()
     if not raw:
-        return TERM_THINKING
+        return default
     if raw in {"default", "provider-default"}:
         return None
     if raw == "disabled":
         return {"type": "disabled"}
     if raw in {"low", "high", "max"}:
         return {"type": "enabled", "reasoning_effort": raw}
-    return TERM_THINKING
+    return default
+
+
+def _resolve_term_thinking() -> dict[str, str] | None:
+    return _resolve_thinking(TERM_THINKING_ENV, TERM_THINKING)
 
 
 def _term_tier_tag(thinking: dict[str, str] | None) -> str:
@@ -1347,16 +1362,7 @@ _SUMMARY_RETRY_BACKOFF_SECONDS = 1.0
 
 
 def _resolve_summary_thinking() -> dict[str, str] | None:
-    raw = os.environ.get(SUMMARY_THINKING_ENV, "").strip().lower()
-    if not raw:
-        return SUMMARY_THINKING
-    if raw in {"default", "provider-default"}:
-        return None
-    if raw == "disabled":
-        return {"type": "disabled"}
-    if raw in {"low", "high", "max"}:
-        return {"type": "enabled", "reasoning_effort": raw}
-    return SUMMARY_THINKING
+    return _resolve_thinking(SUMMARY_THINKING_ENV, SUMMARY_THINKING)
 
 
 def aggregate_deep_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2194,16 +2200,7 @@ _ANSWER_NO_RETRY_STATUSES = frozenset({401, 403, 429})
 
 
 def _resolve_question_thinking() -> dict[str, str] | None:
-    raw = os.environ.get(QUESTION_THINKING_ENV, "").strip().lower()
-    if not raw:
-        return QUESTION_THINKING
-    if raw in {"default", "provider-default"}:
-        return None
-    if raw == "disabled":
-        return {"type": "disabled"}
-    if raw in {"low", "high", "max"}:
-        return {"type": "enabled", "reasoning_effort": raw}
-    return QUESTION_THINKING
+    return _resolve_thinking(QUESTION_THINKING_ENV, QUESTION_THINKING)
 
 
 def _salvage_answer_object(text: str) -> dict[str, Any] | None:
@@ -2248,6 +2245,9 @@ def _valid_answer_object(value: Any) -> bool:
 
 
 def _answer_status_no_retry(exc: Exception) -> bool:
+    status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        return status in _ANSWER_NO_RETRY_STATUSES
     match = re.fullmatch(r"AI request returned HTTP (\d{3})", str(exc))
     return bool(match) and int(match.group(1)) in _ANSWER_NO_RETRY_STATUSES
 
@@ -2376,19 +2376,13 @@ _JUDGE_SUMMARY_PROMPT = (
 
 
 def _resolve_judge_thinking() -> dict[str, str] | None:
-    raw = os.environ.get(JUDGE_THINKING_ENV, "").strip().lower()
-    if not raw:
-        return JUDGE_THINKING
-    if raw in {"default", "provider-default"}:
-        return None
-    if raw == "disabled":
-        return {"type": "disabled"}
-    if raw in {"low", "high", "max"}:
-        return {"type": "enabled", "reasoning_effort": raw}
-    return JUDGE_THINKING
+    return _resolve_thinking(JUDGE_THINKING_ENV, JUDGE_THINKING)
 
 
 def _judge_status_no_retry(exc: Exception) -> bool:
+    status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        return status in _JUDGE_NO_RETRY_STATUSES
     match = re.fullmatch(r"AI request returned HTTP (\d{3})", str(exc))
     return bool(match) and int(match.group(1)) in _JUDGE_NO_RETRY_STATUSES
 

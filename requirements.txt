@@ -1,4 +1,5 @@
 curl-cffi==0.15.0
+funasr-onnx==0.4.3
 numpy==2.2.6
 Pillow==12.3.0
 pycryptodome==3.23.0
