@@ -1,6 +1,6 @@
 {
   "exporter": {
-    "allowlist_sha256": "b636b1f88b08db97d036e385e35a5b2bccab3cd7b6224910c3e70cda0e569e38",
+    "allowlist_sha256": "cfa4f1eea1bebf1358e73f8911e0152406e17224d188a131b481d84ec4aad838",
     "version": "1.0.0"
   },
   "payload": {
@@ -20,8 +20,8 @@
       {
         "mode": "100644",
         "path": ".github/workflows/ci.yml",
-        "sha256": "37cd5042e961243cd5cf9091fa241508eb1ed85a925eb63b39758913d4c0165a",
-        "size": 2733
+        "sha256": "8808147244d2e409b73e649609ab37891873bfddda015222d3a4634ebd630e78",
+        "size": 3183
       },
       {
         "mode": "100644",
@@ -43,6 +43,12 @@
       },
       {
         "mode": "100644",
+        "path": ".github/workflows/llm.yml",
+        "sha256": "5dce001df97d5d168e2391e173763a0b21b58dbc94caa8a38e0b6ac4e1e90e7f",
+        "size": 3199
+      },
+      {
+        "mode": "100644",
         "path": ".github/workflows/mirror-policy.yml",
         "sha256": "f7be15ed1048d1e8c7d57c94e8572f2de50ee9127e7caa07a0910fbc9c684ca8",
         "size": 1951
@@ -50,8 +56,8 @@
       {
         "mode": "100644",
         "path": ".github/workflows/process.yml",
-        "sha256": "50bde4d8cb95e9b1dc6e18f54f9527b9c28b33448c353574ed5c052f351bbc9e",
-        "size": 3712
+        "sha256": "122d96ce1497b2c827299f3000f90fd3c935161ce4719cb8e872a441c79fcaba",
+        "size": 4299
       },
       {
         "mode": "100644",
@@ -206,8 +212,8 @@
       {
         "mode": "100644",
         "path": "requirements.txt",
-        "sha256": "6219266f1984ab87e91c0c9ff438b33be53ac338e407e61c6ff81848384b2d69",
-        "size": 164
+        "sha256": "be1501e067b1963535f9d91c70966d0662c93b886602339e11a951e13b5132d8",
+        "size": 822
       },
       {
         "mode": "100644",
@@ -238,6 +244,12 @@
         "path": "scripts/install_models.py",
         "sha256": "328ae4011b3753e59c1808c11ec886a61cb72615c25e489a60bc8f49090955cf",
         "size": 10766
+      },
+      {
+        "mode": "100644",
+        "path": "scripts/punct_inference_proof.py",
+        "sha256": "085eeba5933ce27d3db1d72146110727a84ee16a61e1ca056ea4aaf0c0569b4e",
+        "size": 8518
       },
       {
         "mode": "100644",
@@ -451,6 +463,12 @@
       },
       {
         "mode": "100644",
+        "path": "tests/test_punct_engine_pin.py",
+        "sha256": "44ce99ea4074495a2d3fbc8e375d77b13a1df670c26792052dca932ab9f6defa",
+        "size": 2886
+      },
+      {
+        "mode": "100644",
         "path": "tests/test_quality_judge.py",
         "sha256": "01e0f0c4345a92ac2e9e0e57e8658153d03e61743f6d83ad1bb118c00bcdfdbb",
         "size": 23323
@@ -536,8 +554,8 @@
       {
         "mode": "100644",
         "path": "tests/test_workflows.py",
-        "sha256": "d137b969401d5720f4b197ee5a7c6cb995b9f410cbf745d2d2317b259bbc5adb",
-        "size": 3346
+        "sha256": "69c7b04d68cd43fff41f06f96cb5989ba393e490323c9802ea854b10c4ffbe7a",
+        "size": 4505
       },
       {
         "mode": "100644",
@@ -546,8 +564,8 @@
         "size": 10522
       }
     ],
-    "git_tree": "d8e0f7f940cf2573b22aac6f91261a2bffd5e65f",
-    "tree_sha256": "77a8ff164326ba33ee1e6b0950740c83d821a4fa0fcba1ef82408d615e03e3d1"
+    "git_tree": "7686e6cb6dee329b499872ab6c3cb741e0e31ced",
+    "tree_sha256": "e764c736e63142aaa9a0d11aba7ccfd656d6d402e986e45c7e7bb161b1282785"
   },
   "protocol": {
     "supported_versions": [
@@ -556,8 +574,8 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "733a0e8f17ef4f802e84a93dddd7da502ad7468e",
+    "commit": "f08b6c085eb38c5b7061c4501b46671942a8e220",
     "repository": "Fudan-CourseLens-Private",
-    "worker_tree": "378a2d6b198f72d9a8fadce32275f3dbd50be113"
+    "worker_tree": "460dd4f31faf5d5236d70f1fa09202669cdf288e"
   }
 }

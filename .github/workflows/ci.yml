@@ -34,6 +34,19 @@ jobs:
           fi
           python -m compileall -q courselens_worker shared scripts
 
+  punct-inference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.10"
+      - name: Real punctuation inference proof (N10 merge gate, fail-closed)
+        run: python scripts/punct_inference_proof.py
+
   gitleaks:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
