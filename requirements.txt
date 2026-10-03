@@ -1,9 +1,21 @@
 curl-cffi==0.15.0
+# N10 案 a（R1-N17 拆弹后的重落地）：funasr-onnx==0.4.3 引擎本体不进本文件——
+# 其元数据钉 numpy<=1.26.4 与库钉 numpy==2.2.6 同解析必 ResolutionImpossible，
+# 且本文件被 process.yml/cloud-daily/cloud-verify/synthetic-smoke 与私仓 CI
+# 多处直接安装。引擎由 process.yml 与 scripts/punct_inference_proof.py 按
+# 同一分步配方 --no-deps 单装（守卫测试钉两处版本一致）；下列为其真实
+# 运行时传递依赖的显式钉（py3.10+numpy 2.2.6 实测解析与导入通过）。
+jieba==0.42.1
+kaldi-native-fbank==1.22.3
+librosa==0.11.0
 numpy==2.2.6
 Pillow==12.3.0
 pycryptodome==3.23.0
 PyNaCl==1.6.2
+PyYAML==6.0.3
 rapidocr-onnxruntime==1.4.4
 requests==2.34.2
+scipy==1.15.3
+sentencepiece==0.2.2
 sherpa-onnx==1.13.4
 zstandard==0.25.0
