@@ -1,0 +1,126 @@
+name: Run unattended CourseLens daily automation
+run-name: CourseLens cloud daily ${{ github.run_id }}
+
+on:
+  # SMART-SCHED fixed grid (2026-10-06): one Beijing point 30 minutes after
+  # each standard period ends, weekdays only (Asia/Shanghai = UTC+8, no DST,
+  # so the UTC crons hold year-round), plus a nightly 22:00 Beijing fallback
+  # every day that catches anything the grid could not see.
+  schedule:
+    - cron: "15 1 * * 1-5"  # 09:15 Beijing, period 1 ends 08:45
+    - cron: "10 2 * * 1-5"  # 10:10 Beijing, period 2 ends 09:40
+    - cron: "10 3 * * 1-5"  # 11:10 Beijing, period 3 ends 10:40
+    - cron: "5 4 * * 1-5"   # 12:05 Beijing, period 4 ends 11:35
+    - cron: "0 5 * * 1-5"   # 13:00 Beijing, period 5 ends 12:30
+    - cron: "45 6 * * 1-5"  # 14:45 Beijing, period 6 ends 14:15
+    - cron: "40 7 * * 1-5"  # 15:40 Beijing, period 7 ends 15:10
+    - cron: "40 8 * * 1-5"  # 16:40 Beijing, period 8 ends 16:10
+    - cron: "35 9 * * 1-5"  # 17:35 Beijing, period 9 ends 17:05
+    - cron: "30 10 * * 1-5" # 18:30 Beijing, period 10 ends 18:00
+    - cron: "0 14 * * *"    # 22:00 Beijing nightly fallback, every day
+  workflow_dispatch:
+    inputs:
+      trigger_kind:
+        description: Closed-set trigger kind
+        required: false
+        default: manual
+        type: choice
+        options: [manual, acceptance]
+      config_hash:
+        description: Opaque configuration digest
+        required: false
+        type: string
+      gate_fake_time:
+        description: Acceptance-only fake Beijing time for the schedule gate
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: courselens-cloud-${{ github.repository_id }}
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      vars.COURSELENS_CLOUD_ENABLED == 'true'
+    runs-on: macos-15
+    timeout-minutes: 330
+    environment: courselens-worker
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      COURSELENS_CLOUD_STUDENT_ID: ${{ secrets.COURSELENS_CLOUD_STUDENT_ID }}
+      COURSELENS_CLOUD_PASSWORD: ${{ secrets.COURSELENS_CLOUD_PASSWORD }}
+      COURSELENS_CLOUD_DEEPSEEK_API_KEY: ${{ secrets.COURSELENS_CLOUD_DEEPSEEK_API_KEY }}
+      COURSELENS_CLOUD_RULES_JSON: ${{ secrets.COURSELENS_CLOUD_RULES_JSON }}
+      COURSELENS_CLOUD_STATE_KEY: ${{ secrets.COURSELENS_CLOUD_STATE_KEY }}
+      COURSELENS_CLOUD_RESULT_PUBLIC_KEY: ${{ vars.COURSELENS_CLOUD_RESULT_PUBLIC_KEY }}
+      WORKER_SIGNING_PRIVATE_KEY: ${{ secrets.WORKER_SIGNING_PRIVATE_KEY }}
+      # v3 run binding: the worker rejects protocol/config/dispatch mismatches
+      # before any school login; manual dispatch stays closed while paused.
+      COURSELENS_CLOUD_TRIGGER_KIND: ${{ inputs.trigger_kind || 'schedule' }}
+      COURSELENS_CLOUD_DISPATCH_CONFIG_HASH: ${{ inputs.config_hash }}
+      COURSELENS_CLOUD_MANUAL_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+      COURSELENS_CLOUD_EXPECTED_CONFIG_HASH: ${{ vars.COURSELENS_CLOUD_CONFIG_HASH }}
+      COURSELENS_CLOUD_EXPECTED_PROTOCOL_VERSION: ${{ vars.COURSELENS_CLOUD_PROTOCOL_VERSION }}
+      COURSELENS_CLOUD_ENABLED_FLAG: ${{ vars.COURSELENS_CLOUD_ENABLED }}
+      # SMART-SCHED gate hook: acceptance-only fake Beijing time; scheduled
+      # runs always see an empty value (inert) and manual dispatches bypass
+      # the gate entirely.  Malformed values fail closed in the worker.
+      COURSELENS_CLOUD_GATE_FAKE_TIME: ${{ inputs.gate_fake_time || '' }}
+      COURSELENS_MODEL_ROOT: ${{ github.workspace }}/.models
+      COURSELENS_ASR_STRATEGY: ${{ vars.COURSELENS_ASR_STRATEGY || 'sequential' }}
+      # N9：执行仓 Variables 缺席时的回退默认与客户端 bootstrap 钉值一致（2，
+      # 代码侧帽 min(2, env) 不变）。
+      COURSELENS_OCR_CONCURRENCY: ${{ vars.COURSELENS_OCR_CONCURRENCY || '2' }}
+      COURSELENS_IMAGE_PREFETCH: ${{ vars.COURSELENS_IMAGE_PREFETCH || '16' }}
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.10"
+          cache: pip
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .models
+          key: ${{ runner.os }}-asr-models-v1-sensevoice-7d1efa21-paraformer-9c49fd9c
+      - name: Install bounded media tools
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+      - name: Install pinned runtime
+        run: python -m pip install --requirement requirements.txt
+      - name: Restore verified model cache
+        run: python scripts/install_models.py
+      - name: Run bounded cloud automation
+        run: python -m courselens_worker.cloud_automation
+      - name: Upload encrypted learning results
+        if: always() && hashFiles('.work/cloud-results/*.box.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: courselens-cloud-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .work/cloud-results/*.box.json
+          if-no-files-found: ignore
+          retention-days: 30
+          compression-level: 0
+      - name: Upload encrypted incremental state
+        if: always() && hashFiles('.work/cloud-state/state.box.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: courselens-cloud-state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .work/cloud-state/state.box.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+      - name: Remove transient data
+        if: always()
+        run: rm -rf .work

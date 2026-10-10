@@ -1,0 +1,72 @@
+name: Verify unattended CourseLens cloud configuration
+run-name: CourseLens cloud verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_hash:
+        description: Opaque configuration digest
+        required: true
+        type: string
+      reset_circuit:
+        description: Reset encrypted circuit state after successful verification
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: courselens-cloud-${{ github.repository_id }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 15
+    environment: courselens-worker
+    env:
+      COURSELENS_CLOUD_VERIFY_ONLY: "1"
+      COURSELENS_CLOUD_RESET_CIRCUIT: ${{ inputs.reset_circuit || 'false' }}
+      GITHUB_TOKEN: ${{ github.token }}
+      COURSELENS_CLOUD_STUDENT_ID: ${{ secrets.COURSELENS_CLOUD_STUDENT_ID }}
+      COURSELENS_CLOUD_PASSWORD: ${{ secrets.COURSELENS_CLOUD_PASSWORD }}
+      COURSELENS_CLOUD_DEEPSEEK_API_KEY: ${{ secrets.COURSELENS_CLOUD_DEEPSEEK_API_KEY }}
+      COURSELENS_CLOUD_RULES_JSON: ${{ secrets.COURSELENS_CLOUD_RULES_JSON }}
+      COURSELENS_CLOUD_STATE_KEY: ${{ secrets.COURSELENS_CLOUD_STATE_KEY }}
+      WORKER_SIGNING_PRIVATE_KEY: ${{ secrets.WORKER_SIGNING_PRIVATE_KEY }}
+      # v3 verification binding: protocol/config mismatches fail before login.
+      COURSELENS_CLOUD_DISPATCH_CONFIG_HASH: ${{ inputs.config_hash }}
+      COURSELENS_CLOUD_EXPECTED_CONFIG_HASH: ${{ vars.COURSELENS_CLOUD_CONFIG_HASH }}
+      COURSELENS_CLOUD_EXPECTED_PROTOCOL_VERSION: ${{ vars.COURSELENS_CLOUD_PROTOCOL_VERSION }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install pinned verification runtime
+        run: python -m pip install --requirement requirements.txt
+      - name: Verify platform and AI configuration
+        run: python -m courselens_worker.cloud_automation
+      # E2E-2v2 定谳缺陷 B：证据上传此前钉在 reset_circuit 派发——普通 verify
+      # （首配/换配的 update-account re-verify）永不上传签名回执，客户端证据
+      # 只能吃旧代 artifact，首配后 verify 链确定性断在 evidence_missing。
+      # worker verify() 仅成功路径写 state.box.json，失败 run 文件缺席=不上传，
+      # 故条件收敛为文件存在即可（条件/可重入）；reset_circuit 语义（熔断
+      # 复位）仍由 env COURSELENS_CLOUD_RESET_CIRCUIT 单独驱动，互不耦合。
+      - name: Upload encrypted verification state
+        if: hashFiles('.work/cloud-state/state.box.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: courselens-cloud-state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .work/cloud-state/state.box.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+      - name: Remove transient data
+        if: always()
+        run: rm -rf .work

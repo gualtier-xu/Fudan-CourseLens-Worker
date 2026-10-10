@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.models/
+.work/
+result.box.json
+*.pem
+*.key
+.env
+.env.*
