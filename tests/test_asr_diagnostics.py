@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+import unittest
+import sys
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from courselens_worker.runner import safe_worker_error_detail
+from courselens_worker.source import MediaResponseProfile
+
+
+class ASRError(RuntimeError):
+    pass
+
+
+class ASRDiagnosticsTests(unittest.TestCase):
+    def test_reason_codes_are_closed_set_and_do_not_echo_input(self):
+        self.assertEqual(
+            safe_worker_error_detail(ASRError("ffmpeg could not decode the authorized media stream")),
+            "media_decode_failed",
+        )
+        secret = "https://example.invalid/video?token=secret"
+        reason = safe_worker_error_detail(ASRError(secret))
+        self.assertEqual(reason, "asr_error")
+        self.assertNotIn("secret", reason)
+
+    def test_ffmpeg_text_is_reduced_to_a_fixed_http_reason(self):
+        error = ASRError("authorized media request returned HTTP 403")
+        self.assertEqual(safe_worker_error_detail(error), "media_http_403")
+
+    def test_media_response_failures_are_reduced_to_closed_reason_codes(self):
+        from courselens_worker import asr  # 夜10-C：conftest 装桩，见 conftest.py
+        cases = (
+            (MediaResponseProfile("http_2xx", "content_html", "magic_html"), "media_content_html"),
+            (MediaResponseProfile("http_2xx", "content_json", "magic_json"), "media_content_json"),
+            (MediaResponseProfile("http_2xx", "content_video", "magic_unknown"), "media_magic_rejected"),
+            (MediaResponseProfile("http_403", "content_html", "magic_html"), "media_http_403"),
+        )
+        for profile, expected in cases:
+            with self.subTest(expected=expected):
+                error = asr._media_response_error(profile)
+                self.assertIsNotNone(error)
+                self.assertEqual(safe_worker_error_detail(error), expected)
+
+    def test_slice_decode_uses_loopback_range_input_and_fast_seek(self):
+        from courselens_worker import asr  # 夜10-C：conftest 装桩，见 conftest.py
+        command = asr._ffmpeg_proxy_command(
+            Path("slice.f32le"),
+            "http://127.0.0.1:4321/random",
+            offset=600,
+            duration=300,
+        )
+        input_index = command.index("-i")
+        seek_index = command.index("-ss")
+        self.assertLess(seek_index, input_index)
+        self.assertEqual(command[input_index + 1], "http://127.0.0.1:4321/random")
+        self.assertNotIn("pipe:0", command)
+
+
+if __name__ == "__main__":
+    unittest.main()
