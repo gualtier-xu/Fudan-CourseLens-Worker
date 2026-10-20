@@ -62,6 +62,17 @@ class SafeWorkerErrorDetailMatrixTests(unittest.TestCase):
         unknown = ASRError("some brand new asr failure text")
         self.assertEqual(safe_worker_error_detail(unknown), "asr_error")
 
+    def test_media_duration_mismatch_maps_to_honest_closed_code(self):
+        """MEDIAMISMATCH-1（DIAG755894-1 P1）：并行字节门证容器完整后的短 PCM
+        =平台媒体与目录时长不符——独立闭集码上行，不再与网络截断共用
+        media_prefetch_incomplete；客户端/驱动可据码停 Retry。"""
+        mismatch = ASRError("authorized media duration mismatch")
+        self.assertEqual(safe_worker_error_detail(mismatch), "media_duration_mismatch")
+        truncated = ASRError("authorized media prefetch was incomplete")
+        self.assertEqual(
+            safe_worker_error_detail(truncated), "media_prefetch_incomplete"
+        )
+
     def test_generic_exception_maps_type_and_sanitized_message(self):
         """N18 rider：闭集外异常带 type+净化消息入 reason（H1 活体若有此早
         一行定位——UnboundLocalError 类裸类型不再零帧逃逸）。"""

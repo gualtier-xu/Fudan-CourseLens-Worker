@@ -48,6 +48,10 @@ NAMESPACE_CHECKPOINT = "chk"
 NAMESPACE_MEASUREMENT = "mtr"
 
 _ID_RE = re.compile(r"^(src|seg|cor|cue|slent|slevt|unit|chk|mtr):[0-9a-f]{12}$")
+# Public alias (V010-ARCH-P0-1 P0-B): the frozen evidence.v1 ID grammar lives
+# only here; consumers import EVIDENCE_ID_RE instead of re-hand-copying the
+# pattern string.  Byte equality is pinned in tests/test_evidence_contract.py.
+EVIDENCE_ID_RE = _ID_RE
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONFIG_HASH_RE = re.compile(r"^[0-9a-f]{12,64}$")
 _LANG_RE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$")

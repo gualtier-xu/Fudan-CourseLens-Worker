@@ -303,13 +303,18 @@ _CHALLENGE_PAGE_MARKERS = (
 )
 
 
-def _challenge_page_sniff(response: Any) -> str:
-    """Return a bounded, case-folded body prefix for page classification."""
+def _bounded_body_text(response: Any) -> str:
+    """Bounded raw body prefix (case preserved) for closed-set extraction."""
     try:
         content = bytes(response.content[:_CHALLENGE_SNIFF_BYTES])
     except Exception:
         return ""
-    return content.decode("utf-8", errors="ignore").casefold()
+    return content.decode("utf-8", errors="ignore")
+
+
+def _challenge_page_sniff(response: Any) -> str:
+    """Return a bounded, case-folded body prefix for page classification."""
+    return _bounded_body_text(response).casefold()
 
 
 def _looks_like_challenge_page(body: str) -> bool:
@@ -328,6 +333,28 @@ def _looks_like_login_form(body: str, url: str = "") -> bool:
         _is_login_target(action)
         for action in re.findall(r"action\s*=\s*['\"]([^'\"]+)['\"]", body)
     )
+
+
+_LOGIN_FORM_ACTION_RE = re.compile(r"action\s*=\s*['\"]([^'\"]+)['\"]")
+_LCK_RE = re.compile(r"[?&]lck=([^&]+)")
+
+
+def _recover_login_lck(body: str) -> str:
+    """R5-WORKERFIX（2026-10-14，37355/39178 批量尾段败定谳）。
+
+    lck 此前只从重定向 Location 头提取，而循环对每个 Location 都已跑过
+    同一正则——真正的盲区只有一种：IDP 零重定向以 200 直落登录表单、
+    服务端把本链新铸的 lck 渲进表单 action。旧码此时误报
+    platform_auth_context_missing（该有未有）。这里对表单 action 按
+    同一闭集正则回收：回收的是服务端本链自发的同一 single-use lck，
+    认证执行照常由服务端校验；回收不到返回空串，调用方仍按原码诚实
+    失败（fail-closed 不变，挑战页分类仍在前）。
+    """
+    for action in _LOGIN_FORM_ACTION_RE.findall(str(body or "")):
+        match = _LCK_RE.search(action)
+        if match:
+            return match.group(1)
+    return ""
 
 
 # SMART-SCHED（2026-10-06）：月课表行结束时刻闭集解析。语义逐条对齐客户端
@@ -607,6 +634,7 @@ class PlatformSession:
         current = f"{IDP_BASE}/idp/authCenter/authenticate?service={quote(service, safe='')}"
         lck = ""
         final_body = ""
+        final_raw = ""
         final_url = ""
         for _ in range(_MAX_REDIRECTS + 1):
             response = self._once(
@@ -620,8 +648,10 @@ class PlatformSession:
                 lck = match.group(1)
                 break
             if status not in _REDIRECTS or not location:
-                # 终止页（通常 200 正文页）：读有界前缀供挑战页分类。
+                # 终止页（通常 200 正文页）：读有界前缀供挑战页分类；
+                # 原始大小写前缀另存供 lck 回收（分类折算会毁大小写）。
                 final_body = _challenge_page_sniff(response)
+                final_raw = _bounded_body_text(response)
                 final_url = str(response.url or "")
                 response.close()
                 break
@@ -633,30 +663,38 @@ class PlatformSession:
             # 同一挑战页；普通无 lck 页维持既有码（外层登录梯会重试）。
             if _looks_like_challenge_page(final_body):
                 raise _fail("platform_challenge_required", connection_stage="webvpn_context")
-            # P65（第六十五案）：IDP「已登录」变体。runner 启动时已登录过一次，
-            # IDP 的 SSO 会话（TGT cookie，随 self.session 存活）中途仍有效；
-            # 会话失效触发重登时 IDP 跳过登录表单直接发票，整条重定向链不出现
-            # lck（lck 只在出新登录表单时发放）——2026-09-24 真机 chunk 3
-            # 九连败的确定性根源。终页非挑战页且非登录表单时，先验证会话
-            # 实际可用性（票据超时路径「宁可验证不可重放」同款判据）：可用
-            # 即按 webvpn 腿成功语义返回，外层照常走课程腿并登记续登回调。
-            if not _looks_like_login_form(final_body, final_url):
-                if self._verify_webvpn_bounded():
-                    _emit_session_telemetry("stage=relogin-variant outcome=already-authed")
-                    return
-                if not _fresh_retry:
-                    _emit_session_telemetry("stage=relogin-variant outcome=fresh-retry")
-                    # 干净重试：陈旧 SSO/TGT cookie 会把下一条链再次引离新
-                    # 登录表单。重建全新 cookie jar（=强制全新登录流）后，
-                    # 同一次 attempt 内按全新链路再试一次；挑战页分类仍在前，
-                    # 梯尽仍按既有闭集码诚实失败。
-                    self._webvpn_ready = False
-                    self._course_bearer = ""
-                    self._userinfo = None
-                    self._rebuild_sessions()
-                    self._login_webvpn(account, password, _fresh_retry=True)
-                    return
-            raise _fail("platform_auth_context_missing")
+            # R5-WORKERFIX：Location 头没带 lck 不等于上下文缺失——先从终页
+            # 登录表单 action 回收（200 直落形态的盲区，见助手注）。
+            recovered = _recover_login_lck(final_raw)
+            if recovered:
+                _emit_session_telemetry("stage=login-context outcome=recovered")
+                lck = recovered
+            else:
+                # P65（第六十五案）：IDP「已登录」变体。runner 启动时已登录过一次，
+                # IDP 的 SSO 会话（TGT cookie，随 self.session 存活）中途仍有效；
+                # 会话失效触发重登时 IDP 跳过登录表单直接发票，整条重定向链不出现
+                # lck（lck 只在出新登录表单时发放）——2026-09-24 真机 chunk 3
+                # 九连败的确定性根源。终页非挑战页且非登录表单时，先验证会话
+                # 实际可用性（票据超时路径「宁可验证不可重放」同款判据）：可用
+                # 即按 webvpn 腿成功语义返回，外层照常走课程腿并登记续登回调。
+                if not _looks_like_login_form(final_body, final_url):
+                    if self._verify_webvpn_bounded():
+                        _emit_session_telemetry("stage=relogin-variant outcome=already-authed")
+                        return
+                    if not _fresh_retry:
+                        _emit_session_telemetry("stage=relogin-variant outcome=fresh-retry")
+                        # 干净重试：陈旧 SSO/TGT cookie 会把下一条链再次引离新
+                        # 登录表单。重建全新 cookie jar（=强制全新登录流）后，
+                        # 同一次 attempt 内按全新链路再试一次；挑战页分类仍在前，
+                        # 梯尽仍按既有闭集码诚实失败。
+                        self._webvpn_ready = False
+                        self._course_bearer = ""
+                        self._userinfo = None
+                        self._rebuild_sessions()
+                        self._login_webvpn(account, password, _fresh_retry=True)
+                        return
+                _emit_session_telemetry("stage=login-context outcome=missing")
+                raise _fail("platform_auth_context_missing")
 
         method_data = _json(self._once(
             "POST", f"{IDP_BASE}/idp/authn/queryAuthMethods",
@@ -1066,7 +1104,7 @@ class PlatformSession:
                 # 头走已验证的 webvpn 会话 cookie。runner 的 schedule 触发形态
                 # 下罐内恒无载体，旧「懒提取硬失败」曾把门腿与发现腿双双打成
                 # platform_session_rejected 的 course_ticket_follow_direct 塌缩
-                # 码（2026-10-07 run 37557294406 闭集定谳，verify 链从不发
+                # 码（2026-10-07 内部 workflow run 闭集定谳，verify 链从不发
                 # authorization_required 请求故恒 PASS 的形态差）。direct 会话
                 # 仍强制 bearer（该路径唯一凭证）。
                 bearer = self._optional_course_bearer(self.session)

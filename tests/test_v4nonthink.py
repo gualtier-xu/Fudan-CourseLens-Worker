@@ -507,6 +507,7 @@ class SummaryGlossaryTests(unittest.TestCase):
     def test_glossary_flows_into_window_prompt_and_merge_input(self):
         from courselens_worker.llm import (
             _SUMMARY_WINDOW_PROMPT_WITH_GLOSSARY,
+            _WINDOW_TEACHING_SUFFIX,
             REVIEW_VIEWS_ENV,
             create_summary,
         )
@@ -522,15 +523,18 @@ class SummaryGlossaryTests(unittest.TestCase):
                 ppt_pages=[], glossary=("能带图", "电势"),
             )
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0][0]["content"], _SUMMARY_WINDOW_PROMPT_WITH_GLOSSARY)
+        # V010-STEM-P0-1：窗口提示词=变体+教学保真后缀（基础串本体一字不改）。
+        self.assertEqual(calls[0][0]["content"],
+                         _SUMMARY_WINDOW_PROMPT_WITH_GLOSSARY + _WINDOW_TEACHING_SUFFIX)
         window_payload = json.loads(calls[0][1]["content"])
         self.assertEqual(window_payload["glossary"], ["能带图", "电势"])
         merge_payload = json.loads(calls[1][1]["content"])
         self.assertEqual(merge_payload["glossary"], ["能带图", "电势"])
 
-    def test_no_glossary_keeps_prompts_byte_identical(self):
+    def test_no_glossary_window_prompt_is_base_plus_teaching_suffix(self):
         from courselens_worker.llm import (
             _SUMMARY_WINDOW_PROMPT,
+            _WINDOW_TEACHING_SUFFIX,
             create_summary,
         )
 
@@ -542,7 +546,7 @@ class SummaryGlossaryTests(unittest.TestCase):
                 "key", title="t", transcript=[{"start_ms": 0, "end_ms": 900, "text": "内容"}],
                 ppt_pages=[],
             )
-        self.assertEqual(calls[0][0]["content"], _SUMMARY_WINDOW_PROMPT)
+        self.assertEqual(calls[0][0]["content"], _SUMMARY_WINDOW_PROMPT + _WINDOW_TEACHING_SUFFIX)
         self.assertNotIn("glossary", json.loads(calls[1][1]["content"]))
 
     def test_merge_prompt_stays_within_300_pin(self):

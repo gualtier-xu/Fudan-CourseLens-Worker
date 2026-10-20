@@ -189,6 +189,31 @@ class ASREvidenceIdentityTests(unittest.TestCase):
         for checkpoint in checkpoints:
             self.assertNotIn("pcm_fingerprint", checkpoint)
 
+    def test_media_evidence_identity_accompanies_result_and_degrades_honestly(self):
+        # V010-CONTENTLIFE-1-D：transcribe 结果随附媒体证据身份（云窗台账防
+        # 假更新的证据源）——指纹链完整=media_evidence_id（证据契约 source
+        # id）+ 纯内容 PCM 摘要 media_fingerprint；legacy 检查点（链不可验）
+        # =两键诚实缺席，缺字段永远不是信号。
+        result = self._run(self._pool(), proofread=None)
+        fingerprint = result["media_fingerprint"]
+        self.assertRegex(fingerprint, r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            result["media_evidence_id"],
+            asr._source_evidence_id(fingerprint, 1250.0),
+        )
+        # 与段级 source_hash 同源（同一条 PCM 摘要链）。
+        self.assertEqual(result["segments"][0]["source_hash"], fingerprint)
+        legacy = {
+            "completed_chunks": 1,
+            "total_chunks": 3,
+            "mode": "automatic",
+            "raw_sensevoice": [{"start_ms": 0, "end_ms": 1000, "text": "legacy@0"}],
+            "raw_paraformer": [{"start_ms": 0, "end_ms": 1000, "text": "legacy-fire@0"}],
+        }
+        degraded = self._run(self._pool(), prior=legacy, proofread=None)
+        self.assertNotIn("media_evidence_id", degraded)
+        self.assertNotIn("media_fingerprint", degraded)
+
     def test_automatic_proofread_stamps_final_and_raw_segments(self):
         pool = self._pool()
         result = self._run(pool, media_seconds=600)

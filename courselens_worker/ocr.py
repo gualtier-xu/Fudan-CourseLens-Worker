@@ -162,6 +162,15 @@ def process_slides(
     at several distinct timeline events, so a repeat is never classified as
     a skipped or error page and identical-looking perceptual hashes never
     discard or merge content — ``dhash`` stays a diagnostic field only.
+    V010-PPT-DEDUP-1: exact repeated content within one job still runs the
+    OCR engine only once — later occurrences reuse the recognized text (and
+    the deterministic dhash/junk features of the identical bytes) while
+    keeping their own per-page records, order, and timeline events.  Each
+    reused occurrence is counted honestly under ``ppt_dedup_pages`` in the
+    counts mapping; it is a work-saved counter, not a skip reason.  Near
+    duplicates (similar ``dhash``, different bytes) are never merged and
+    always OCR individually.  The reuse map lives in memory for this job
+    only and is never persisted across runs.
     The one perceptual skip reason is ``junk_page``: the fixed blacklist
     plus the V2 featureless/chrome/semantic stages (``junk_filter``) drop
     junk screenshots there, each counted under the same closed-set reason.
@@ -178,6 +187,16 @@ def process_slides(
     )
     entity_by_content: dict[str, str] = {}
     first_page_by_content: dict[str, int] = {}
+    # V010-PPT-DEDUP-1：完全同页（raw bytes sha256 相同）只跑一次 OCR 的
+    # job 内内存复用表——成功页存记录模板（含 dhash/_junk，文本原样），
+    # 跳过页存闭集原因。仅内存、仅本 job；检查点续跑时由先前页预置，
+    # 绝不跨 run 持久缓存。近重页（dhash 相似、字节不同）不进此表。
+    ocr_outcome_by_content: dict[str, dict[str, Any]] = {}
+    skip_reason_by_content: dict[str, str] = {}
+    for prior_page in output:
+        prior_content = str(prior_page.get("source_sha256") or "")
+        if prior_content and prior_page.get("text") is not None:
+            ocr_outcome_by_content.setdefault(prior_content, dict(prior_page))
 
     def _attach_identity(page: dict[str, Any]) -> None:
         content = str(page.get("source_sha256") or "")
@@ -220,13 +239,53 @@ def process_slides(
             }
             raw_pages = {index: fetched[index].result() for index in indices}
         with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="ocr") as ocr_pool:
-            recognized = {
-                index: ocr_pool.submit(_ocr_page, index, slides[index], raw_pages[index][0])
-                for index in indices
-            }
+            # V010-PPT-DEDUP-1：派发前按 raw bytes sha256 查复用表——命中即
+            # 不再提交 OCR（本批内后见的同字节页经 pending 表同样命中）；
+            # 未命中的首个见次才真正进引擎。
+            recognized: dict[int, Any] = {}
+            reused: dict[int, str] = {}
+            content_by_index: dict[int, str] = {}
+            batch_pending: dict[str, int] = {}
+            for index in indices:
+                raw = raw_pages[index][0]
+                content = hashlib.sha256(raw).hexdigest() if raw else ""
+                content_by_index[index] = content
+                if content and (content in ocr_outcome_by_content or content in batch_pending):
+                    reused[index] = content
+                else:
+                    if content:
+                        batch_pending[content] = index
+                    recognized[index] = ocr_pool.submit(
+                        _ocr_page, index, slides[index], raw
+                    )
             for index in indices:
                 fetch_reason = raw_pages[index][1]
-                page, ocr_reason = recognized[index].result()
+                content = content_by_index.get(index, "")
+                if index in reused:
+                    template = ocr_outcome_by_content.get(content)
+                    if template is not None:
+                        item = slides[index]
+                        page = {
+                            "page_num": int(item.get("page_num") or index + 1),
+                            "created_sec": int(item.get("created_sec") or 0),
+                            "text": str(template.get("text") or ""),
+                            "dhash": template.get("dhash"),
+                            "source_sha256": content,
+                            "_junk": template.get("_junk"),
+                        }
+                        ocr_reason = ""
+                    else:
+                        page = None
+                        ocr_reason = skip_reason_by_content.get(content) or "ocr_failed"
+                    skipped["ppt_dedup_pages"] = int(skipped.get("ppt_dedup_pages") or 0) + 1
+                else:
+                    page, ocr_reason = recognized[index].result()
+                    if content:
+                        if page is not None:
+                            # 模板副本须在 _junk 摘除前留底，供同字节后续页克隆。
+                            ocr_outcome_by_content[content] = dict(page)
+                        elif ocr_reason:
+                            skip_reason_by_content[content] = ocr_reason
                 reason = fetch_reason or ocr_reason
                 if page is None:
                     if reason:

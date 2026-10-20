@@ -21,6 +21,7 @@ import unittest
 from unittest.mock import patch
 
 from courselens_worker.llm import (
+    _JUDGE_COACH_SUFFIX,
     JUDGE_THINKING,
     JUDGE_THINKING_ENV,
     LLMError,
@@ -98,12 +99,14 @@ def _judge_responder(subtitle_payloads, summary_payloads):
                 "latency_ms": 10, "thinking": None,
             })
         system = messages[0]["content"]
-        if system in (_JUDGE_FLASH_SUBTITLE_PROMPT, _JUDGE_ADJ_SUBTITLE_PROMPT):
+        if system in (_JUDGE_FLASH_SUBTITLE_PROMPT + _JUDGE_COACH_SUFFIX,
+                      _JUDGE_ADJ_SUBTITLE_PROMPT + _JUDGE_COACH_SUFFIX):
             payloads = subtitle_payloads or ["垃圾一"]
             index = min(calls["subtitle"], len(payloads) - 1)
             calls["subtitle"] += 1
             return payloads[index]
-        assert system in (_JUDGE_FLASH_SUMMARY_PROMPT, _JUDGE_ADJ_SUMMARY_PROMPT), system[:40]
+        assert system in (_JUDGE_FLASH_SUMMARY_PROMPT + _JUDGE_COACH_SUFFIX,
+                          _JUDGE_ADJ_SUMMARY_PROMPT + _JUDGE_COACH_SUFFIX), system[:40]
         payloads = summary_payloads or ["垃圾一"]
         index = min(calls["summary"], len(payloads) - 1)
         calls["summary"] += 1
@@ -413,9 +416,9 @@ class JudgeCallTests(unittest.TestCase):
 
         def _chat(api_key, messages, *, max_tokens=8192, thinking=None, timeout=180.0):
             system = messages[0]["content"]
-            if system == _JUDGE_FLASH_SUBTITLE_PROMPT:
+            if system == _JUDGE_FLASH_SUBTITLE_PROMPT + _JUDGE_COACH_SUFFIX:
                 return json.dumps(_SUBTITLE_FINDINGS)
-            assert system == _JUDGE_ADJ_SUBTITLE_PROMPT, system[:40]
+            assert system == _JUDGE_ADJ_SUBTITLE_PROMPT + _JUDGE_COACH_SUFFIX, system[:40]
             capture["adj_input"] = json.loads(messages[1]["content"])
             return json.dumps({"findings": []})
 

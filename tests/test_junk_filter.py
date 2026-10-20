@@ -325,7 +325,8 @@ class JunkPipelineTests(unittest.TestCase):
         normal_png = _png_bytes(_normal_slides()[3])
         pages, skipped, engine = self._run([junk_png, normal_png, junk_png])
         self.assertEqual([page["page_num"] for page in pages], [2])
-        self.assertEqual(skipped, {JUNK_PAGE_SKIP_REASON: 2})
+        # V010-PPT-DEDUP-1：同字节 junk 页复用闭集原因逐页照计，另记复用数。
+        self.assertEqual(skipped, {JUNK_PAGE_SKIP_REASON: 2, "ppt_dedup_pages": 1})
         self.assertEqual(engine.call_count, 1)
         self.assertEqual(pages[0]["text"], "text")
 
@@ -364,7 +365,9 @@ class JunkPipelineTests(unittest.TestCase):
         normal_png = _png_bytes(_normal_slides()[3])
         pages, skipped, _engine = self._run([normal_png, normal_png])
         self.assertEqual(len(pages), 2)
-        self.assertEqual(skipped, {})
+        # V010-PPT-DEDUP-1：内容页零跳过；同字节页只记复用数，不记任何
+        # 跳过/错误原因。
+        self.assertEqual(skipped, {"ppt_dedup_pages": 1})
 
 
 @unittest.skipIf(Image is None or numpy is None, "Pillow and numpy runtimes required")

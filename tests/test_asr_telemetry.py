@@ -20,7 +20,9 @@ from courselens_worker.asr import (
     _ChunkTicker,
     _mem_available_kb,
     _mem_available_kb_from,
+    _refresh_media_authorization,
 )
+from courselens_worker.platform_session import PlatformSessionError
 
 
 TICK_LINE_RE = re.compile(
@@ -59,6 +61,47 @@ class MemAvailableTests(unittest.TestCase):
     def test_missing_platform_file_returns_minus_one(self):
         missing = Path(tempfile.gettempdir()) / "courselens-no-such-meminfo"
         self.assertEqual(_mem_available_kb(missing), -1)
+
+
+class RefreshMediaAuthorizationLadderTests(unittest.TestCase):
+    """R5-WORKERFIX（2026-10-14，37355/39178 批量尾段败定谳）。
+
+    预取重取梯的 elapsed 形参是回调（Callable[[], int]）；37355 实录中
+    调用点曾传 elapsed=_elapsed_ticks()——把 int 当回调传入，梯内首次
+    遇到可重试闭集码时遥测行 elapsed() 即抛
+    TypeError: 'int' object is not callable：掩盖真实闭集码 + 从 except
+    处理器内炸出跳过剩余退避重试。两钉分别护调用点（源钉）与梯语义
+    （行为钉）。
+    """
+
+    def test_retryable_failure_emits_telemetry_and_exhausts_the_ladder(self):
+        proxy = Mock()
+        proxy.refresh_source = Mock(side_effect=[
+            PlatformSessionError("platform_session_rejected"),
+            None,
+        ])
+        elapsed = Mock(return_value=7)
+        lines = []
+        with patch.object(asr, "_emit_telemetry", side_effect=lines.append), \
+             patch.object(asr.time, "sleep"):
+            _refresh_media_authorization(proxy, chunk=2, elapsed=elapsed)
+        self.assertEqual(proxy.refresh_source.call_count, 2, "一次可重试败+一次成功")
+        elapsed.assert_called_once_with()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("stage=source-refresh-retry", lines[0])
+        self.assertIn("chunk=2", lines[0])
+        self.assertIn("reason=platform_session_rejected", lines[0])
+        self.assertIn("elapsed=7", lines[0])
+
+    def test_prefetch_refresh_passes_the_callback_not_its_result(self):
+        """源钉：调用点必须传 _elapsed_ticks 本体，禁传其调用结果。"""
+        with open(asr.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("elapsed=_elapsed_ticks,", source)
+        self.assertNotIn(
+            "elapsed=_elapsed_ticks(),", source,
+            "曾把调用结果（int）当回调传入——R5 尾段败根因，禁止回潮",
+        )
 
 
 class ChunkTickerTests(unittest.TestCase):

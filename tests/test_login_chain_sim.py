@@ -148,6 +148,27 @@ class LoginChainSimTests(unittest.TestCase):
         )
         self.assertEqual(STATS["webvpn_entries"], 1, "已登录变体一次进入即成功")
 
+    def test_r5workerfix_lck_in_form_action_completes_the_chain(self):
+        """R5-WORKERFIX 链路级：200 直落表单、action 携服务端新铸 lck → 全链登入。
+
+        R5 实录（37355/39178 尾段败）：lck 只从 Location 头提取时，这种
+        零重定向直落形态被误报 platform_auth_context_missing。回收后
+        authExecute 的 single-use 校验照常——伪造/陈旧 lck 在此被拒，
+        fail-closed 语义由 not_delivered 用例（无 lck 普通页仍报缺）对偶钉住。
+        """
+        set_mode("lck_in_form")
+        lines = []
+        with self._endpoints():
+            connector = PlatformSession(transport="requests")
+            with patch(
+                "courselens_worker.platform_session._emit_session_telemetry",
+                side_effect=lines.append,
+            ):
+                connector._login_webvpn_full("account", "password", attempts=1)
+        self.assertTrue(connector._webvpn_ready)
+        self.assertEqual(STATS["webvpn_entries"], 1, "回收链一次进入即成功")
+        self.assertIn("stage=login-context outcome=recovered", lines)
+
     def test_p65_stale_sso_ticket_recovers_via_fresh_retry(self):
         """P65 (b) 链路级：陈旧票据验证不过 → 清态全新 cookie jar 重试一次 → 成功。"""
         set_mode("sso_then_delivered")

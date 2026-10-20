@@ -29,6 +29,9 @@ Failure modes (one roll per webvpn context entry):
   expire_then_delivered  夜10-C: webvpn leg delivered, first course entry
                  lands on a plain login page (mid-flow expiry, no lck); the
                  outer ladder's full relogin recovers on the second entry
+  lck_in_form    R5-WORKERFIX: zero-redirect 200 login form whose action
+                 carries a freshly minted single-use lck (the Location-only
+                 extraction blind spot); recovery must complete the chain
 """
 
 import json
@@ -48,7 +51,7 @@ VPN_KEY = b"wrdvpnisthebest!"
 VPN_IV = b"wrdvpnisthebest!"
 MODES = ("delivered", "not_delivered", "challenge",
          "sso_direct", "sso_then_delivered",
-         "challenge_at_course", "expire_then_delivered")
+         "challenge_at_course", "expire_then_delivered", "lck_in_form")
 
 _lock = threading.Lock()
 _mode = {"mode": "delivered"}
@@ -218,6 +221,17 @@ class _Handler(BaseHTTPRequestHandler):
             if mode in ("not_delivered", "challenge"):
                 self._send(200, _CHALLENGE_HTML if mode == "challenge"
                            else _PLAIN_LOGIN_HTML)
+                return
+            if mode == "lck_in_form":
+                # R5-WORKERFIX：零重定向 200 直落登录表单，lck 只在表单
+                # action（服务端本链新铸；authExecute 的 single-use 校验
+                # 照常生效——回收的必须是真 lck，伪造值在此被拒）。
+                lck = "LCK-" + uuid.uuid4().hex
+                with _lock:
+                    _LCKS[lck] = att_id
+                self._send(200, "<html><body><form action='/idp/ac/login?lck="
+                                + lck + "'><input name='password'></form>"
+                                "login page</body></html>")
                 return
         if leg == "course":
             with _lock:

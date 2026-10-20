@@ -335,6 +335,57 @@ def _decode_failure(stderr: str) -> ASRError:
     return ASRError("ffmpeg could not decode the authorized media stream")
 
 
+def _emit_media_decode_probe_telemetry(source_ref: str) -> None:
+    """DIAG34970-1 P1（2026-10-20）：解码失败路径的 ffprobe 流清单闭集遥测。
+
+    34970 三讲定谳残余（无音轨 S1 / 音轨不可解 S2 / 深损 S3）共享同一个
+    兜底 media_decode_failed 形状，一条流清单证据即可闭合。仅本地容器路径
+    探测（URL 一律跳过——观测绝不发起网络外呼）；字段闭集=流数与
+    ``codec_type:codec_name`` 枚举（闭集外类型归 unknown，名只留字母数字），
+    零 URL/零内容/零字节数，与既有 stage= 遥测同安全面。行为零改动：本
+    helper 只观测不抛（探测自身失败也按闭集形状如实上报），调用点随后原样
+    走既有 ``_decode_failure`` 分类，拒绝语义一字不变。
+    """
+    try:
+        container = Path(source_ref)
+        if not container.is_file():
+            return
+        returncode, stdout, _ = _run_bounded_process(
+            [
+                "ffprobe", "-v", "error", "-show_entries",
+                "stream=index,codec_type,codec_name", "-of", "csv=p=0",
+                str(container),
+            ],
+            timeout=30,
+            capture_stdout=True,
+        )
+    except Exception:
+        _emit_telemetry("stage=media-decode-probe probe=failed")
+        return
+    if returncode != 0:
+        _emit_telemetry("stage=media-decode-probe probe=failed")
+        return
+    known_types = frozenset({"audio", "video", "subtitle", "data", "attachment"})
+    streams: list[str] = []
+    total = 0
+    for line in stdout.decode("utf-8", errors="replace").splitlines()[:32]:
+        fields = [item.strip() for item in line.split(",")]
+        if len(fields) < 2:
+            continue
+        total += 1
+        if len(streams) >= 8:
+            continue
+        codec_type = fields[1] if fields[1] in known_types else "unknown"
+        codec_name = re.sub(r"[^a-z0-9_]", "", fields[2].casefold() if len(fields) > 2 else "")[:24]
+        streams.append(f"{codec_type}:{codec_name or 'unknown'}")
+    if not streams:
+        _emit_telemetry("stage=media-decode-probe streams=0 codecs=none")
+        return
+    _emit_telemetry(
+        f"stage=media-decode-probe streams={total} codecs={','.join(streams)}"
+    )
+
+
 def _media_response_error(profile: MediaResponseProfile) -> ASRError | None:
     http_messages = {
         "http_401": "authorized media request returned HTTP 401",
@@ -718,6 +769,17 @@ _MEDIA_RETRY_MESSAGES = frozenset({
 # fail-closed；分块短块/空切片同码归真，不再错标 decode 失败。
 _MEDIA_PREFETCH_INCOMPLETE_MESSAGE = "authorized media prefetch was incomplete"
 
+# MEDIAMISMATCH-1（2026-10-17，DIAG755894-1 根因 P1 裁决）：755894 平台更换媒体
+# 后实际音频短于目录声明时长（声明 10065s，实解码仅 ~93-97%），PCM 完整性门与
+# 网络截断共用 media_prefetch_incomplete——学生面只见泛化 remote_failed，真实
+# 死因不可见，17 次重驱全烧在同一确定性失败上。并行路径段级字节门已逐段核账
+# （received==expected）即容器完整已证，此后解码 PCM 仍短于期望只可能是「媒体
+# 内容本身短于目录声明」——按独立闭集码如实上报，载荷带实测/声明两秒数（纯
+# 数字，禁 URL/凭据）；单流路径零变化（proven_complete 缺省 False，维持截断
+# 守卫语义）。该码确定性成立，transcribe 层重取梯不重驱（梯度语义：仅
+# media_prefetch_incomplete 进梯）。
+_MEDIA_DURATION_MISMATCH_MESSAGE = "authorized media duration mismatch"
+
 # P55（第五十五案）：块边界授权刷新此前裸奔——真机事故 2026-09-24：粗腿与前两
 # 块正常，chunk 2 边界 refresh 抛 platform_auth_context_missing 整单即死，且死在
 # decode-start 遥测之前（死窗无痕）。边界刷新与块内媒体重取同族：同量退避梯
@@ -910,7 +972,10 @@ def _prefetch_media_pcm_parallel(
             for index in range(len(bounds)):
                 with (parts_dir / f"seg-{index:04d}.bin").open("rb") as source:
                     shutil.copyfileobj(source, sink, length=1 << 20)
-        _decode_media_to_pcm(str(container), target, duration=duration)
+        # 段级字节门此刻已全部核账通过（每段 received==expected），容器完整性
+        # 已证：传 proven_complete=True，此后 PCM 门短量按 media_duration_mismatch
+        # 如实归因（媒体内容短于目录声明），不再与网络截断共用一个码。
+        _decode_media_to_pcm(str(container), target, duration=duration, proven_complete=True)
         return True
     except _RangeUnsupported:
         return False
@@ -930,11 +995,21 @@ def _prefetch_media_pcm_parallel(
             pass
 
 
-def _decode_media_to_pcm(source_ref: str, target: Path, *, duration: float) -> None:
+def _decode_media_to_pcm(
+    source_ref: str,
+    target: Path,
+    *,
+    duration: float,
+    proven_complete: bool = False,
+) -> None:
     """One bounded ffmpeg pass from a URL or local container to gated PCM.
 
     单流与并行分段两条预取路径共用的解码+完整性门；闭集码与 MEDIA-FIX-
-    PREFETCH-1 期望字节门在此唯一维护。
+    PREFETCH-1 期望字节门在此唯一维护。proven_complete=True 仅由并行路径在
+    段级字节门逐段核账通过后传入（MEDIAMISMATCH-1）：容器完整已证时短 PCM
+    只可能是媒体内容短于目录声明，按 media_duration_mismatch 闭集码如实
+    失败（载荷=实测/声明秒数，遥测行同账）；单流路径缺省 False，维持
+    media_prefetch_incomplete 截断守卫语义零变化。
     """
     command = [
         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
@@ -954,6 +1029,9 @@ def _decode_media_to_pcm(source_ref: str, target: Path, *, duration: float) -> N
         target.unlink(missing_ok=True)
         raise ASRError("authorized media upstream connection failed")
     if returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+        # DIAG34970-1 P1：失败定谳观测先行（本地容器才探，URL 静默跳过），
+        # 随后分类与拒绝语义零变化。
+        _emit_media_decode_probe_telemetry(source_ref)
         target.unlink(missing_ok=True)
         raise _decode_failure(ffmpeg_stderr.decode("utf-8", errors="replace"))
     # 完整性门（MEDIA-FIX-PREFETCH-1）：ffmpeg 对提前 EOF exit 0，期望字节
@@ -961,8 +1039,24 @@ def _decode_media_to_pcm(source_ref: str, target: Path, *, duration: float) -> N
     # 放行截断文件去烧后续分块 ASR。
     expected_bytes = int(round(duration * SAMPLE_RATE)) * _PCM_SAMPLE_BYTES
     minimum_bytes = expected_bytes - SAMPLE_RATE * _PCM_SAMPLE_BYTES
-    if target.stat().st_size < minimum_bytes:
+    actual_bytes = target.stat().st_size
+    if actual_bytes < minimum_bytes:
         target.unlink(missing_ok=True)
+        if proven_complete:
+            # MEDIAMISMATCH-1：段级字节门已证容器完整，短 PCM=媒体内容短于目录
+            # 声明（755894 形状）。独立闭集码+实测/声明两秒数上行（遥测行与
+            # 异常属性，纯数字零 URL/凭据）；确定性失败，调用方不进重取梯。
+            measured_seconds = max(0, actual_bytes // (SAMPLE_RATE * _PCM_SAMPLE_BYTES))
+            declared_seconds = max(0, int(duration))
+            _emit_telemetry(
+                "stage=media-duration-mismatch "
+                f"measured_seconds={measured_seconds} declared_seconds={declared_seconds} "
+                f"bytes={actual_bytes} expected_bytes={expected_bytes}"
+            )
+            error = ASRError(_MEDIA_DURATION_MISMATCH_MESSAGE)
+            error.measured_seconds = measured_seconds
+            error.declared_seconds = declared_seconds
+            raise error
         raise ASRError(_MEDIA_PREFETCH_INCOMPLETE_MESSAGE)
 
 
@@ -1297,6 +1391,8 @@ def _decode_chunk_from_url(
         target.unlink(missing_ok=True)
         raise ASRError("authorized media upstream connection failed")
     if returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+        # DIAG34970-1 P1：同面覆盖（分块源恒为 URL，is_file 守卫使其自然零操作）。
+        _emit_media_decode_probe_telemetry(media_url)
         target.unlink(missing_ok=True)
         raise _decode_failure(ffmpeg_stderr.decode("utf-8", errors="replace"))
 
@@ -1697,6 +1793,8 @@ def transcribe(
             try:
                 _prefetch_media_pcm(proxy.url, full_pcm, duration=duration)
             except ASRError as exc:
+                # media_duration_mismatch（MEDIAMISMATCH-1）是确定性内容失败，
+                # 不进重取梯——换签名 URL 重驱必同败，原样上行停 Retry。
                 if str(exc) != _MEDIA_PREFETCH_INCOMPLETE_MESSAGE:
                     raise
                 _emit_telemetry(
@@ -1704,10 +1802,16 @@ def transcribe(
                     f"reason=media_prefetch_incomplete elapsed={_elapsed_ticks()}"
                 )
                 time.sleep(_MEDIA_RETRY_BACKOFF_SECONDS[0])
+                # R5-WORKERFIX（2026-10-14，37355/39178 批量尾段败定谳）：此处
+                # 曾传 elapsed=_elapsed_ticks()——把调用结果（int）当回调传入，
+                # 梯内首次遇到可重试闭集码时遥测行 elapsed() 即抛
+                # TypeError: 'int' object is not callable：既掩盖真实闭集码，
+                # 又从 except 处理器内炸出、跳过剩余退避重试（瞬态刷新失败
+                # 被升格成整单即死）。传回调本体，梯语义按 P55 原设计生效。
                 _refresh_media_authorization(
                     proxy,
                     chunk=completed_chunks,
-                    elapsed=_elapsed_ticks(),
+                    elapsed=_elapsed_ticks,
                     label="face=prefetch",
                 )
                 _prefetch_media_pcm(proxy.url, full_pcm, duration=duration)
@@ -1856,6 +1960,12 @@ def transcribe(
     final_segments = normalize_segments(final)
     raw_rough = normalize_segments(rough_segments)
     raw_refined = normalize_segments(refined_segments)
+    # V010-CONTENTLIFE-1-D：媒体证据身份随结果透传（additive，缺指纹链诚实
+    # 缺席=缺字段永远不是信号）。media_evidence_id=证据契约 source id
+    # （_source_evidence_id=PCM 摘要+声明时长派生，随 outputs 入客户端可见面）；
+    # media_fingerprint=纯内容 PCM 摘要（时长无关），供云窗台账做「时长未变
+    # 但内容已换」与「时长巧合变化但内容未变」的双向鉴伪。
+    source_id: str | None = None
     if verifiable_fingerprint and fingerprint_state is not None:
         config_hash = _timing_config_hash(asr_energy_ratio())
         source_id = _source_evidence_id(fingerprint_state, duration)
@@ -1909,6 +2019,12 @@ def transcribe(
         # raw_ 开头，runner 转发面零变化）。
         "proofread_alternates": raw_rough,
         **({"warnings": ["proofread_degraded"]} if proofread_degraded else {}),
+        # V010-CONTENTLIFE-1-D：媒体证据身份 additive 透传（见上注释；runner
+        # outputs 面按存在与否转发，客户端旧合同零扰动）。
+        **(
+            {"media_evidence_id": source_id, "media_fingerprint": fingerprint_state}
+            if source_id and fingerprint_state is not None else {}
+        ),
         "metrics": {
             "duration_seconds": duration,
             "elapsed_seconds": round(time.monotonic() - started, 3),

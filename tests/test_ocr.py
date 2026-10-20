@@ -105,7 +105,8 @@ class SlideOcrToleranceTests(unittest.TestCase):
     def test_all_slides_unavailable_still_returns_without_raising(self):
         pages, skipped = self._run([HTML, HTML])
         self.assertEqual(pages, [])
-        self.assertEqual(skipped, {"html_body": 2})
+        # V010-PPT-DEDUP-1：同字节页复用闭集原因照旧逐页计数，另记复用数。
+        self.assertEqual(skipped, {"html_body": 2, "ppt_dedup_pages": 1})
 
     def test_empty_body_is_classified_as_empty(self):
         pages, skipped = self._run([b"", PNG])
@@ -212,7 +213,7 @@ class SlideOcrToleranceTests(unittest.TestCase):
     def test_repeated_content_is_one_entity_with_separate_events(self):
         pages, skipped = self._run([PNG, PNG], deck=DECK)
         self.assertEqual(len(pages), 2)
-        self.assertEqual(skipped, {})
+        self.assertEqual(skipped, {"ppt_dedup_pages": 1})
         self.assertEqual(pages[0]["source_sha256"], pages[1]["source_sha256"])
         self.assertEqual(pages[0]["entity_id"], pages[1]["entity_id"])
         self.assertNotEqual(pages[0]["event_id"], pages[1]["event_id"])
@@ -230,6 +231,105 @@ class SlideOcrToleranceTests(unittest.TestCase):
         self.assertNotEqual(pages[0]["source_sha256"], pages[1]["source_sha256"])
         self.assertNotEqual(pages[0]["entity_id"], pages[1]["entity_id"])
 
+    def test_exact_duplicate_pages_run_ocr_once_and_keep_every_record(self):
+        # V010-PPT-DEDUP-1：同 job 内 raw bytes sha256 相同的页 OCR 只跑
+        # 一次；逐页记录全保留（页序/页数/dhash/sha256 不变，文本复用）。
+        from courselens_worker.ocr import process_slides
+
+        engine_calls: list[int] = []
+
+        def counting_engine():
+            engine_calls.append(1)
+            return lambda image: ([["box", "text"]], 0.1)
+
+        slides = [
+            {
+                "page_num": index + 1,
+                "created_sec": index * 10,
+                "source": {"url": f"https://example.invalid/{index}"},
+            }
+            for index in range(3)
+        ]
+        with patch("courselens_worker.ocr.fetch_bytes", side_effect=lambda source: PNG), \
+             patch("courselens_worker.ocr._dhash", return_value="ab01ef01ab01ef01"), \
+             patch("courselens_worker.ocr._engine", side_effect=counting_engine):
+            pages, skipped = process_slides(slides, progress=lambda *_args: None)
+        self.assertEqual(len(engine_calls), 1)
+        self.assertEqual([page["page_num"] for page in pages], [1, 2, 3])
+        self.assertEqual(skipped, {"ppt_dedup_pages": 2})
+        for page in pages:
+            self.assertEqual(page["source_sha256"], pages[0]["source_sha256"])
+            self.assertEqual(page["text"], "text")
+            self.assertEqual(page["dhash"], "ab01ef01ab01ef01")
+
+    def test_near_duplicate_similarity_never_reuses_or_merges(self):
+        # 近重页（dhash 相似、字节不同）照常逐页 OCR——防同图不同标注误合并。
+        from courselens_worker.ocr import process_slides
+
+        engine_calls: list[int] = []
+
+        def counting_engine():
+            engine_calls.append(1)
+            return lambda image: ([["box", "text"]], 0.1)
+
+        slides = [
+            {
+                "page_num": index + 1,
+                "created_sec": index * 10,
+                "source": {"url": f"https://example.invalid/{index}"},
+            }
+            for index in range(2)
+        ]
+        responses = {
+            "https://example.invalid/0": PNG,
+            "https://example.invalid/1": PNG_ALT,
+        }
+        with patch(
+            "courselens_worker.ocr.fetch_bytes",
+            side_effect=lambda source: responses[str(source.get("url"))],
+        ), patch("courselens_worker.ocr._dhash", return_value="ab01ef01ab01ef01"), \
+             patch("courselens_worker.ocr._engine", side_effect=counting_engine):
+            pages, skipped = process_slides(slides, progress=lambda *_args: None)
+        self.assertEqual(len(engine_calls), 2)
+        self.assertEqual(len(pages), 2)
+        self.assertEqual(skipped, {})
+
+    def test_resume_reuses_prior_checkpoint_content_without_rerunning_ocr(self):
+        # 续跑预置：同 job 先前检查点已识别页的内容进复用表，同字节续页
+        # 零引擎调用且记录恒等（entity/event 语义不变）。
+        from courselens_worker.ocr import process_slides
+
+        expected, _ = self._run([PNG, PNG], deck=DECK)
+        prior = {
+            "ocr_completed_items": 1,
+            "ppt_pages": [dict(expected[0])],
+            "ppt_skipped": {},
+        }
+        engine_calls: list[int] = []
+
+        def counting_engine():
+            engine_calls.append(1)
+            return lambda image: ([["box", "text"]], 0.1)
+
+        slides = [
+            {
+                "page_num": index + 1,
+                "created_sec": index * 10,
+                "source": {"url": f"https://example.invalid/{index}"},
+                "deck": DECK,
+            }
+            for index in range(2)
+        ]
+        with patch("courselens_worker.ocr.fetch_bytes", side_effect=lambda source: PNG), \
+             patch("courselens_worker.ocr._dhash", return_value="ab01ef01ab01ef01"), \
+             patch("courselens_worker.ocr._engine", side_effect=counting_engine):
+            pages, skipped = process_slides(
+                slides, progress=lambda *_args: None, prior_checkpoint=prior
+            )
+        self.assertEqual(engine_calls, [])
+        self.assertEqual(pages, expected)
+        self.assertEqual(skipped, {"ppt_dedup_pages": 1})
+
     def test_identity_is_deterministic_across_runs(self):
         first = self._run([PNG, PNG_ALT], deck=DECK)[0]
         second = self._run([PNG, PNG_ALT], deck=DECK)[0]
@@ -241,7 +341,7 @@ class SlideOcrToleranceTests(unittest.TestCase):
     def test_unscoped_slides_carry_no_identity(self):
         pages, skipped = self._run([PNG, PNG])
         self.assertEqual(len(pages), 2)
-        self.assertEqual(skipped, {})
+        self.assertEqual(skipped, {"ppt_dedup_pages": 1})
         for page in pages:
             self.assertNotIn("entity_id", page)
             self.assertNotIn("event_id", page)
@@ -296,6 +396,8 @@ class SlideOcrToleranceTests(unittest.TestCase):
         }
         pages, skipped = self._run([HTML, HTML], prior=prior)
         self.assertEqual(pages, [])
+        # 续跑从 ocr_completed_items=1 起只处理第 2 页，先前 run 的跳过页
+        # 不进本 run 复用表——计数与复用语义均不回退。
         self.assertEqual(skipped, {"unidentified_image": 1, "html_body": 2})
 
     def test_checkpoint_payload_carries_skip_counts(self):
@@ -366,6 +468,26 @@ class RunnerSlideWarningTests(unittest.TestCase):
         self.assertEqual(result["outputs"]["ppt_pages"], [])
         self.assertEqual(result["warnings"], [])
         self.assertNotIn("slides_skipped", result["metrics"])
+
+    def test_dedup_counter_is_observed_without_skip_warning(self):
+        # V010-PPT-DEDUP-1：纯复用 job 是健康 job——计数单列 metrics，
+        # 不触发 slides_skipped 警告、不进通知面。
+        result, _slides_call, _summary_call = self._run_summary(
+            self._summary_job([{"source": {}}]),
+            ([{"page_num": 1}], {"ppt_dedup_pages": 2}),
+        )
+        self.assertEqual(result["metrics"]["ppt_dedup_pages"], 2)
+        self.assertNotIn("slides_skipped", result["metrics"])
+        self.assertEqual(result["warnings"], [])
+
+    def test_dedup_counter_is_split_out_of_skip_notices(self):
+        result, _slides_call, _summary_call = self._run_summary(
+            self._summary_job([{"source": {}}]),
+            ([], {"unidentified_image": 1, "ppt_dedup_pages": 3}),
+        )
+        self.assertEqual(result["metrics"]["slides_skipped"], {"unidentified_image": 1})
+        self.assertEqual(result["metrics"]["ppt_dedup_pages"], 3)
+        self.assertEqual(result["warnings"], ["slides_skipped"])
 
 
 if __name__ == "__main__":

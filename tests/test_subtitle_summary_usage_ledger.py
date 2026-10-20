@@ -176,7 +176,7 @@ class SummaryUsageLedgerTests(unittest.TestCase):
         def _fake_chat(api_key, messages, **kwargs):
             with llm_mod._USAGE_LOCK:
                 llm_mod._CALL_LOG.append(_usage_record(100, 50))
-            if messages[0]["content"] == llm_mod._SUMMARY_MERGE_PROMPT:
+            if messages[0]["content"] == llm_mod._SUMMARY_MERGE_PROMPT_TEACHING:
                 return json.dumps({"markdown": "combined", "chapters": []})
             return json.dumps({"markdown": "part", "chapters": []})
 

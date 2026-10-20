@@ -96,7 +96,7 @@ class TimeoutBudgetTests(unittest.TestCase):
 
         def fake_chat(api_key, messages, **kwargs):
             captured.append((messages, kwargs))
-            if messages[0]["content"] == llm_mod._SUMMARY_MERGE_PROMPT:
+            if messages[0]["content"] == llm_mod._SUMMARY_MERGE_PROMPT_TEACHING:
                 return json.dumps({"markdown": "combined", "chapters": []})
             return json.dumps({"markdown": "part", "chapters": []})
 
@@ -111,11 +111,11 @@ class TimeoutBudgetTests(unittest.TestCase):
             llm_mod.create_summary("sk-synthetic", title="t", transcript=segments, ppt_pages=[])
         merge_calls = [
             kwargs for messages, kwargs in captured
-            if messages[0]["content"] == llm_mod._SUMMARY_MERGE_PROMPT
+            if messages[0]["content"] == llm_mod._SUMMARY_MERGE_PROMPT_TEACHING
         ]
         window_calls = [
             kwargs for messages, kwargs in captured
-            if messages[0]["content"] != llm_mod._SUMMARY_MERGE_PROMPT
+            if messages[0]["content"] != llm_mod._SUMMARY_MERGE_PROMPT_TEACHING
         ]
         self.assertEqual(len(merge_calls), 1)
         self.assertEqual(merge_calls[0]["timeout"], llm_mod._SUMMARY_MERGE_TIMEOUT_SECONDS)

@@ -91,7 +91,7 @@ class SummaryProgressTests(unittest.TestCase):
         emissions: list[tuple[str, int, int]] = []
 
         def fake_chat(api_key, messages, **kwargs):
-            if messages[0]["content"] == llm_mod._SUMMARY_MERGE_PROMPT:
+            if messages[0]["content"] == llm_mod._SUMMARY_MERGE_PROMPT_TEACHING:
                 return json.dumps({"markdown": "combined", "chapters": []})
             return json.dumps({"markdown": "part", "chapters": []})
 
@@ -117,7 +117,7 @@ class SummaryProgressTests(unittest.TestCase):
         emissions: list[tuple[str, int, int]] = []
 
         def fake_chat(api_key, messages, **kwargs):
-            if messages[0]["content"] == llm_mod._SUMMARY_MERGE_PROMPT:
+            if messages[0]["content"] == llm_mod._SUMMARY_MERGE_PROMPT_TEACHING:
                 return json.dumps({"markdown": "combined", "chapters": []})
             if "第120段" in messages[1]["content"]:
                 # 窗口级重试预算盖坏形不盖传输异常（传输 LLMError 立即穿透）：

@@ -285,7 +285,7 @@ class PlatformSessionTests(unittest.TestCase):
         self.assertEqual(request.kwargs["timeout"], (5, 15))
 
     def test_webvpn_authorized_request_omits_bearer_when_token_carrier_absent(self):
-        # PLATFORM-REWORK 形态钉（2026-10-07 run 37557294406 闭集定谳）：
+        # PLATFORM-REWORK 形态钉（2026-10-07 内部 workflow run 闭集定谳）：
         # wengine 网关把 origin cookie 服务端映射，webvpn 会话罐内恒无
         # _token serialized 载体；authorization_required 请求此时必须省略
         # Authorization 头照发（走登录时 _verify_course 已上游验证的会话
@@ -1063,9 +1063,54 @@ class PlatformSessionTests(unittest.TestCase):
             with self.assertRaises(PlatformSessionError) as captured:
                 connector._login_webvpn("account", "password")
         self.assertEqual(str(captured.exception), "platform_auth_context_missing")
-        self.assertEqual(lines, ["stage=relogin-variant outcome=fresh-retry"])
+        self.assertEqual(
+            lines,
+            [
+                "stage=relogin-variant outcome=fresh-retry",
+                # R5-WORKERFIX：终局缺类遥测行——下次再遇可从日志直读页形
+                # （回收不到 lck、验证与干净重试俱败），不再死得无痕。
+                "stage=login-context outcome=missing",
+            ],
+        )
         self.assertEqual(connector._rebuild_sessions.call_count, 1)
         self.assertEqual(connector._verify_webvpn_bounded.call_count, 2, "首次+干净重试各验证一次")
+
+    def test_r5workerfix_lck_in_login_form_action_is_recovered(self):
+        """R5-WORKERFIX：IDP 200 直落登录表单、lck 在 action → 回收并照常走认证流。"""
+        connector = object.__new__(PlatformSession)
+        form_page = self._context_page(
+            "<html><body><form action='/idp/ac/login?lck=LCK-FORM-1'>"
+            "<input type='password'>login page</form></body></html>"
+        )
+        methods_page = Mock()
+        methods_page.json.return_value = {"data": []}
+        connector._once = Mock(side_effect=[form_page, methods_page])
+        lines = []
+        with patch("courselens_worker.platform_session._emit_session_telemetry", side_effect=lines.append):
+            with self.assertRaises(PlatformSessionError) as captured:
+                connector._login_webvpn("account", "password")
+        self.assertEqual(
+            str(captured.exception), "platform_auth_method_missing",
+            "流程越过 context 阶段：回收的 lck 进入认证方法查询，按其闭集码失败",
+        )
+        self.assertEqual(lines, ["stage=login-context outcome=recovered"])
+        second_call = connector._once.call_args_list[1]
+        self.assertEqual(second_call.args[0], "POST")
+        self.assertEqual(
+            second_call.kwargs["json"]["lck"], "LCK-FORM-1",
+            "认证方法查询携带的正是回收到的同一 lck",
+        )
+
+    def test_r5workerfix_recovery_source_pin_uses_the_shared_closed_set_regex(self):
+        """R5-WORKERFIX 源钉：回收必须复用既有 lck 闭集正则，不发明新词汇表。"""
+        import courselens_worker.platform_session as platform_session_module
+
+        with open(platform_session_module.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("def _recover_login_lck(body: str) -> str:", source)
+        self.assertIn("_LCK_RE.search(action)", source)
+        self.assertIn("stage=login-context outcome=recovered", source)
+        self.assertIn("stage=login-context outcome=missing", source)
 
     def test_connection_failure_retries_without_retrying_authentication_errors(self):
         class FlakyConnector(_FakeConnector):

@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from courselens_worker.llm import (
     _REVIEW_VIEWS_PROMPT,
+    _REVIEW_VIEWS_PROMPT_TEACHING,
     LLMError,
     REVIEW_VIEWS_ENV,
     _derive_review_views,
@@ -83,7 +84,7 @@ def _stage_responder(window_payload, merge_payload, views_payloads):
                 "latency_ms": 10, "thinking": None,
             })
         system = messages[0]["content"]
-        if system == _REVIEW_VIEWS_PROMPT:
+        if system == _REVIEW_VIEWS_PROMPT_TEACHING:
             index = min(calls["views"], len(views_payloads) - 1)
             calls["views"] += 1
             return views_payloads[index]
@@ -339,7 +340,7 @@ class CreateSummaryIntegrationTests(unittest.TestCase):
 
         def _chat(api_key, messages, **kwargs):
             system = messages[0]["content"]
-            if system == _REVIEW_VIEWS_PROMPT:
+            if system == _REVIEW_VIEWS_PROMPT_TEACHING:
                 seen["payload"] = json.loads(messages[1]["content"])
                 return json.dumps(_VIEWS, ensure_ascii=False)
             if "assessment_events" in system:

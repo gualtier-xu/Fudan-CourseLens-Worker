@@ -244,6 +244,46 @@ class SegmentLadderTests(unittest.TestCase):
             )
 
 
+class ProvenCompleteMismatchTests(unittest.TestCase):
+    """MEDIAMISMATCH-1：并行路径段级字节门全过（容器完整已证）后 PCM 门短量
+    =媒体内容短于目录声明——独立闭集码 media_duration_mismatch 上行，且
+    proven_complete=True 只由并行路径传入（单流回落路径零变化）。"""
+
+    MISMATCH = "authorized media duration mismatch"
+
+    def test_parallel_full_segments_short_decode_raises_duration_mismatch(self):
+        payload = bytes(range(256)) * 4096
+        server, thread, url = _serve(payload)
+        _cleanup_server(self, server, thread)
+        captured = {}
+        real_decode = asr._decode_media_to_pcm
+
+        def spy_decode(source_ref, target, *, duration, **kwargs):
+            captured["proven_complete"] = bool(kwargs.get("proven_complete"))
+            return real_decode(source_ref, target, duration=duration, **kwargs)
+
+        def fake_run(command, timeout=None, capture_stdout=False):
+            # 段级字节门全过后 ffmpeg 只解出 9s/600s：755894 时长不符形状
+            Path(command[-1]).write_bytes(b"\x00" * _pcm_bytes(9.0))
+            return 0, None, b""
+
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "media-full.f32le"
+            with (
+                patch.object(asr, "_MEDIA_PREFETCH_MIN_SEGMENT_BYTES", 16 * 1024),
+                patch.object(asr, "_run_bounded_process", side_effect=fake_run),
+                patch.object(asr, "_decode_media_to_pcm", side_effect=spy_decode),
+            ):
+                with self.assertRaises(asr.ASRError) as caught:
+                    asr._prefetch_media_pcm(url, target, duration=600.0)
+        self.assertTrue(
+            captured["proven_complete"], "并行路径必须以容器已证完整调用解码门"
+        )
+        self.assertEqual(str(caught.exception), self.MISMATCH)
+        self.assertEqual(caught.exception.declared_seconds, 600)
+        self.assertFalse(target.exists(), "短量产物必须清理")
+
+
 @unittest.skipIf(shutil.which("ffmpeg") is None, "ffmpeg not available")
 class ParallelRealFfmpegTests(unittest.TestCase):
     """真 ffmpeg 端到端：真实 mp4 经并行分段预取过完整性门；段截断段级拦下。"""

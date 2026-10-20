@@ -85,6 +85,48 @@ class PrefetchCompletenessGateTests(unittest.TestCase):
             self.assertEqual(str(caught.exception), INCOMPLETE)
 
 
+class MediaDurationMismatchGateTests(unittest.TestCase):
+    """MEDIAMISMATCH-1（DIAG755894-1 P1，2026-10-17）：并行段级字节门已证容器
+    完整（proven_complete=True）后 PCM 短量=媒体内容短于目录声明（755894 形状：
+    声明 10065s 实解码仅 ~93-97%）——独立闭集码 + 实测/声明两秒数载荷，不再与
+    网络截断共用 media_prefetch_incomplete；单流路径（缺省 False）零变化。"""
+
+    MISMATCH = "authorized media duration mismatch"
+
+    def _raise_gate(self, *, proven_complete: bool) -> asr.ASRError:
+        def fake_run(command, timeout=None, capture_stdout=False):
+            Path(command[-1]).write_bytes(b"\x00" * _pcm_bytes(597.0))
+            return 0, None, b""
+
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "media-full.f32le"
+            with patch.object(asr, "_run_bounded_process", side_effect=fake_run):
+                with self.assertRaises(asr.ASRError) as caught:
+                    asr._decode_media_to_pcm(
+                        "http://127.0.0.1/session",
+                        target,
+                        duration=600.0,
+                        proven_complete=proven_complete,
+                    )
+            self.assertFalse(target.exists(), "短量产物必须删除，绝不留给分块消费")
+        return caught.exception
+
+    def test_proven_complete_short_pcm_raises_mismatch_with_payload(self):
+        error = self._raise_gate(proven_complete=True)
+        self.assertEqual(str(error), self.MISMATCH)
+        self.assertEqual(error.measured_seconds, 597)
+        self.assertEqual(error.declared_seconds, 600)
+
+    def test_single_stream_default_keeps_incomplete_without_payload(self):
+        error = self._raise_gate(proven_complete=False)
+        self.assertEqual(str(error), INCOMPLETE)
+        self.assertFalse(hasattr(error, "measured_seconds"), "截断路径不带时长载荷")
+
+    def test_runner_maps_duration_mismatch_to_closed_code(self):
+        error = self._raise_gate(proven_complete=True)
+        self.assertEqual(safe_worker_error_detail(error), "media_duration_mismatch")
+
+
 class SliceShortBlockGateTests(unittest.TestCase):
     """分块切片门：满块精确、短块/空切片按真实根因 fail-closed（真文件 I/O）。"""
 
