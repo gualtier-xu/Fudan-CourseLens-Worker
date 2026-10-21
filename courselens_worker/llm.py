@@ -18,6 +18,12 @@ import requests
 from .formats import normalize_segments
 from .glossary import apply_glossary
 from .retry import LadderExhausted, LadderFailure, run_ladder
+from .summary_contract import (
+    SCHEMA_VER,
+    annotate_assessment_events,
+    build_chapters_v2,
+    build_summary_doc,
+)
 from .course_knowledge import (
     coverage_summary,
     evidence_index,
@@ -1432,14 +1438,20 @@ def aggregate_deep_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# V010-WORKER-PROMPT-1（总控批准提案，权=product-n22learnpage2-result-
+# 20261021.md）：takeaway 无下限→「必须输出3-6条」+负面约束（禁转写原句/
+# 寒暄/口头禅）。配套客户端要点段只收核心结论（c8b8f10）：key_takeaways 是
+# 要点段唯一内容源，模型缺产=要点段诚实隐藏，故须在提示词侧保证产出。帽内
+# 修订：CJK-Latin 间距压缩+「原有合法→原合法」，299/300 防膨胀钉内零膨胀；
+# key_takeaways 字段名/结构零变化（客户端按此消费）。
 _SUMMARY_MERGE_PROMPT = (
-    "合并各窗口笔记为完整中文学习笔记，不得增加输入外事实。输出 JSON 对象，"
-    "字段为 markdown 和 chapters；保留原有合法 start_ms，"
-    "另输出 key_takeaways（≤6条、每条≤30字）"
-    "和 assessment_events（仅当提到课程考核，每项含 "
-    "category/title/due_hint/quote，category 仅限{"
+    "合并各窗口笔记为完整中文学习笔记，不增输入外事实。输出JSON对象，"
+    "字段为markdown和chapters；保留原合法start_ms，"
+    "必须输出3-6条key_takeaways（每条≤30字，禁转写原句/寒暄/口头禅）"
+    "和assessment_events（仅当提到课程考核，每项含"
+    "category/title/due_hint/quote，category仅限{"
     + ",".join(ASSESSMENT_CATEGORIES)
-    + "}，quote 须为原文，无则空数组）"
+    + "}，quote须为原文，无则空数组）"
 )
 
 # 多源 evidence 版合并提示词：旧提示词已有 300 字守门（worker/tests/
@@ -1477,10 +1489,11 @@ _SUMMARY_EVIDENCE_WINDOW_PROMPT = (
 # 借鉴 learn-stem-deeply 步骤 3-5（提案单 P0-1，出处 product-v010stemlearn-
 # result-20261014.md）：推导型理工讲次总结改教学骨架；非推导型/证据不足=
 # 既有通用格式（默认路径，非 STEM 课现行为零变化）。门控在模型内完成并要求
-# 引用材料证据，禁独立分类调用（零加成本零加延迟）。家规=旧串一字不改
-# （299/300 防膨胀钉原样），教学规则只存在于「+ 后缀」变体串（evidence/
-# glossary 变体同模式）。素材边界：只重排已有字幕/OCR 素材，不增材料外
-# 事实；无对应图像类型就不写对应解读（禁编造图像内容）。
+# 引用材料证据，禁独立分类调用（零加成本零加延迟）。家规沿革=基串经
+# V010-WORKER-PROMPT-1 帽内修订（299/300，总控批准），教学规则仍只在
+# 「+ 后缀」变体串（evidence/glossary 变体同模式）。素材边界：只重排已有
+# 字幕/OCR 素材，不增材料外事实；无对应图像类型就不写对应解读（禁编造图像
+# 内容）。
 _WINDOW_TEACHING_SUFFIX = (
     "笔记须保留机制与推导链（每步为何成立）；幻灯/图像内容按能带/电路/波形/"
     "结构/流程归类记事实（坐标/单位/区域/方向），只记输入内事实。"
@@ -2204,6 +2217,12 @@ def create_summary(
                 "due_hint": str(item.get("due_hint") or "").strip()[:20],
                 "quote": quote,
             })
+    # V010-LEARN-IMPL-P0-1 期 0 events 加法演进（LEARN-D2 §4.6/§4.3.3）：每项
+    # 加法补 confidence/source——合并链候选语义=low（引句已验原文但分类未经
+    # 规则确证，与雷达 source=llm→status=unconfirmed 展示纪律同轴）+来源
+    # transcription；v2 既有四字段（category/title/due_hint/quote）零变化。
+    # end_ms 合法缺省（合并链引句无时间窗，校验器保留可选窗）。
+    events = annotate_assessment_events(events)
     raw_takeaways = value.get("key_takeaways")
     takeaways = []
     if isinstance(raw_takeaways, list):
@@ -2309,6 +2328,12 @@ def create_summary(
     }
     if usage_sink is not None:
         usage_sink.extend(usage_records)
+    # V010-LEARN-IMPL-P0-1 期 0 合同冻结（LEARN-D2 §4.6）：v3 加法标记 + 可选
+    # doc/chapters_v2。板块切片/doc 组装全本地零新调用（确定性切片+已过门产物
+    # 忠实组装）；任一闭集不合=None=整键省略（前端走旧态，绝不半残）——钉测
+    # 载荷（无转写/短讲次）同此降级路径。v2 既有键字段名/结构零变化。
+    chapters_v2 = build_chapters_v2(chapters, transcript)
+    doc = build_summary_doc(value["markdown"], chapters_v2, takeaways)
     _emit_telemetry(
         f"stage=summary windows={len(sources)}/{len(sources)} "
         f"resumed={completed} evidence_windows={len(evidence_windows)} "
@@ -2323,10 +2348,15 @@ def create_summary(
         f"window_skipped={window_skipped} merge_retries={merge_retries} "
         f"llm_calls={deep_usage['calls']} "
         f"completion_tokens={deep_usage['completion_tokens']} "
-        f"reasoning_tokens={deep_usage['reasoning_tokens']}"
+        f"reasoning_tokens={deep_usage['reasoning_tokens']} "
+        f"blocks={len((chapters_v2 or {}).get('items') or ())} "
+        f"doc={1 if doc is not None else 0} "
+        f"chapters_v2={1 if chapters_v2 is not None else 0}"
     )
     result = {
         "model": MODEL,
+        # 期 0 v3 加法标记：恒在场（v3 形状工件；doc/chapters_v2 仍按缺省省键）。
+        "schema_ver": SCHEMA_VER,
         "markdown": value["markdown"].strip(),
         "chapters": chapters,
         "assessment_events": events,
@@ -2352,6 +2382,11 @@ def create_summary(
     # fail-open 形态）；成功=四档子集（全畸形档省键）。
     if review_views is not None:
         result["review_views"] = review_views
+    # 期 0：doc/chapters_v2 过门才落键（缺省=旧 v2 消费者零感知）。
+    if chapters_v2 is not None:
+        result["chapters_v2"] = chapters_v2
+    if doc is not None:
+        result["doc"] = doc
     return result
 
 

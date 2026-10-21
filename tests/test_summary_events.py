@@ -37,6 +37,59 @@ def test_merge_prompt_carries_closed_enumeration_and_stays_bounded():
     assert len(_SUMMARY_MERGE_PROMPT) <= 300
 
 
+def test_merge_prompt_carries_takeaway_floor_and_taboos():
+    """V010-WORKER-PROMPT-1：takeaway 产出下限钉——「必须输出3-6条」约束+
+    每条 ≤30 字帽+负面约束（禁转写原句/寒暄/口头禅）。配套客户端要点段只收
+    核心结论（c8b8f10）：key_takeaways 是要点段唯一内容源，模型缺产=要点段
+    诚实隐藏，故提示词侧必须约束产出；上限 6 并入「3-6条」范围表述。"""
+    assert "必须输出3-6条key_takeaways" in _SUMMARY_MERGE_PROMPT
+    assert "每条≤30字" in _SUMMARY_MERGE_PROMPT
+    for taboo in ("禁转写原句", "寒暄", "口头禅"):
+        assert taboo in _SUMMARY_MERGE_PROMPT
+    # 旧「≤6条」表述退役后上限仍在范围内，防回退钉。
+    assert "≤6条" not in _SUMMARY_MERGE_PROMPT
+    # 帽内零膨胀：修订前后同长（299/300）。
+    assert len(_SUMMARY_MERGE_PROMPT) <= 300
+
+
+def test_new_prompt_reaches_the_wire_and_takeaway_contract_is_unchanged():
+    """V010-WORKER-PROMPT-1 解析走查：新约束文本随合并调用真实下线（mock 捕获
+    合并段 system 串），合规 3 条（下限形状）产出走既有解析链原样透传——
+    key_takeaways 字段名/列表结构/逐条 str 零变化（客户端 c8b8f10 消费合同），
+    负面约束只作用于提示词侧、不改解析行为。"""
+    merge_payload = {
+        "markdown": "# 笔记",
+        "chapters": [],
+        "key_takeaways": ["结论一", "结论二", "结论三"],
+        "assessment_events": [],
+    }
+    _chat, _ = _chat_responder([_base_window(), merge_payload])
+    captured = []
+
+    def _recording_chat(api_key, messages, **kwargs):
+        captured.append(messages)
+        return _chat(api_key, messages, **kwargs)
+
+    with patch("courselens_worker.llm._chat", _recording_chat):
+        value = create_summary("key", title="t", transcript=[], ppt_pages=[{"created_sec": 0}])
+    # 合并调用识别=system 串含 assessment_events（窗口提示词无此字段）；同链
+    # 附带阶段（题目生成等）的 system 也可能提及该字段，故下线断言取「任一
+    # 合并族 system 携带完整新约束」，窗数/阶段数不作硬钉。
+    merge_systems = [
+        messages[0]["content"]
+        for messages in captured
+        if "assessment_events" in messages[0]["content"]
+    ]
+    assert merge_systems
+    assert any("必须输出3-6条key_takeaways" in content for content in merge_systems)
+    assert any(
+        all(taboo in content for taboo in ("禁转写原句", "寒暄", "口头禅"))
+        for content in merge_systems
+    )
+    assert value["key_takeaways"] == ["结论一", "结论二", "结论三"]
+    assert all(isinstance(item, str) for item in value["key_takeaways"])
+
+
 def test_summary_chain_emits_final_telemetry_without_content():
     """夜10-C T10 对称补强：摘要链收口遥测（计数与闭集词，零内容泄漏）。"""
     merge_payload = {
