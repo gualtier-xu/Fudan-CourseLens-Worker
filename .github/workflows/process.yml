@@ -1,0 +1,105 @@
+name: Process encrypted CourseLens job
+run-name: CourseLens job ${{ inputs.task_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: Opaque 32-character job identifier
+        required: true
+        type: string
+      protocol_version:
+        description: Encrypted job protocol version
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: courselens-compute-${{ github.repository_id }}-${{ inputs.task_id }}
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    environment: courselens-worker
+    env:
+      COURSELENS_TASK_ID: ${{ inputs.task_id }}
+      COURSELENS_PROTOCOL_VERSION: ${{ inputs.protocol_version }}
+      COURSELENS_WORKFLOW_PROFILE: process-v1
+      PRIVATE_JOB_REPO: ${{ vars.COURSELENS_MAILBOX_REPO }}
+      PRIVATE_JOB_REPO_TOKEN: ${{ secrets.COURSELENS_JOB_TOKEN || secrets.PRIVATE_JOB_REPO_TOKEN }}
+      WORKER_INPUT_PRIVATE_KEY: ${{ secrets.WORKER_INPUT_PRIVATE_KEY }}
+      WORKER_SIGNING_PRIVATE_KEY: ${{ secrets.WORKER_SIGNING_PRIVATE_KEY }}
+      COURSELENS_MODEL_ROOT: ${{ github.workspace }}/.models
+      COURSELENS_RESULT_PATH: ${{ github.workspace }}/result.box.json
+      COURSELENS_ASR_STRATEGY: ${{ vars.COURSELENS_ASR_STRATEGY || 'sequential' }}
+      # N9：执行仓 Variables 缺席时的回退默认与客户端 bootstrap 钉值一致（2，
+      # 代码侧帽 min(2, env) 不变）。
+      COURSELENS_OCR_CONCURRENCY: ${{ vars.COURSELENS_OCR_CONCURRENCY || '2' }}
+      COURSELENS_IMAGE_PREFETCH: ${{ vars.COURSELENS_IMAGE_PREFETCH || '16' }}
+      # THINK-LADDER-1 Phase 2：质量抽检思考档（用户 2026-10-02 拍板「适当少量
+      # 使用」→ 缺省 low；执行仓 Variables 可调，worker llm.py 闭集解析）。
+      COURSELENS_JUDGE_THINKING: ${{ vars.COURSELENS_JUDGE_THINKING || 'low' }}
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.10"
+          cache: pip
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .models
+          key: asr-models-v1-sensevoice-7d1efa21-paraformer-9c49fd9c
+      - name: Install bounded media tools
+        run: |
+          # N5：runner（ubuntu-24.04）预装 curl 8.5.0，装列表去 curl；ffmpeg
+          # 快路径一探即过（冷路径保持原序列，含 apt 源清理）。热步 23s→<1s。
+          command -v ffmpeg >/dev/null 2>&1 || {
+            sudo find /etc/apt/sources.list.d -type f -name '*.list' -exec sed -i '/dl\.google\.com/d' {} +
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends --yes ffmpeg
+          }
+      - name: Install pinned runtime
+        run: |
+          # N10 案 a：funasr-onnx==0.4.3 元数据钉 numpy<=1.26.4 与库钉
+          # numpy==2.2.6 同解析必 ResolutionImpossible（R1-N17），故核心集
+          # 正常解析、引擎本体 --no-deps 单装；其真实运行时传递依赖已在
+          # requirements.txt 显式钉。配方与 scripts/punct_inference_proof.py
+          # 同源，守卫测试钉两处引擎版本一致。
+          grep -v -E '^funasr-onnx([=<>!~ ]|$)' requirements.txt > /tmp/requirements-core.txt
+          python -m pip install --requirement /tmp/requirements-core.txt
+          python -m pip install --no-deps funasr-onnx==0.4.3
+      - name: Restore verified model cache
+        run: python scripts/install_models.py
+      - name: Process encrypted job
+        run: python -m courselens_worker
+      - name: Upload encrypted checkpoints
+        if: always() && hashFiles('.work/checkpoints/*.box.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: courselens-checkpoint-${{ inputs.task_id }}-${{ github.run_attempt }}
+          path: .work/checkpoints/*.box.json
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 0
+      - name: Upload encrypted result only
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: courselens-result-${{ inputs.task_id }}
+          path: result.box.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Remove transient data
+        if: always()
+        run: |
+          rm -f result.box.json
+          rm -rf .work

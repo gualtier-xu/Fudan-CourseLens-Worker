@@ -1,0 +1,59 @@
+name: Encrypted channel echo
+run-name: CourseLens echo ${{ inputs.task_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: Opaque 32-character job identifier
+        required: true
+        type: string
+      protocol_version:
+        description: Encrypted job protocol version
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # N19：组带 task_id 维度，与 process/llm 同形——同仓两笔并发 echo 不再互斥排队。
+  group: courselens-compute-${{ github.repository_id }}-${{ inputs.task_id }}
+  cancel-in-progress: false
+
+jobs:
+  echo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: courselens-worker
+    env:
+      COURSELENS_TASK_ID: ${{ inputs.task_id }}
+      COURSELENS_PROTOCOL_VERSION: ${{ inputs.protocol_version }}
+      PRIVATE_JOB_REPO: ${{ vars.COURSELENS_MAILBOX_REPO }}
+      PRIVATE_JOB_REPO_TOKEN: ${{ secrets.COURSELENS_JOB_TOKEN || secrets.PRIVATE_JOB_REPO_TOKEN }}
+      WORKER_INPUT_PRIVATE_KEY: ${{ secrets.WORKER_INPUT_PRIVATE_KEY }}
+      WORKER_SIGNING_PRIVATE_KEY: ${{ secrets.WORKER_SIGNING_PRIVATE_KEY }}
+      COURSELENS_RESULT_PATH: ${{ github.workspace }}/result.box.json
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install minimal encrypted-channel runtime
+        run: python -m pip install PyNaCl==1.6.2 requests==2.34.2 zstandard==0.25.0
+      - name: Process encrypted echo
+        run: python -m courselens_worker
+      - name: Upload encrypted echo result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: courselens-result-${{ inputs.task_id }}
+          path: result.box.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Remove transient data
+        if: always()
+        run: |
+          rm -f result.box.json
+          rm -rf .work
