@@ -1,0 +1,13 @@
+{
+  "epoch": 1,
+  "expires_at": 1821342811,
+  "release_keys": [
+    {
+      "key_id": "release-2026-09-cleanroom-r3",
+      "public_key": "NDKf1UidYmP+JHqDtGUyQWUSoTB3fYVw8V2EEHZK/go=",
+      "status": "active"
+    }
+  ],
+  "revoked_manifests": [],
+  "schema": "courselens.worker-mirror.trust.v1"
+}
