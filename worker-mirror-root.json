@@ -1,0 +1,9 @@
+{
+  "root_keys": [
+    {
+      "key_id": "root-2026-09-cleanroom-r3",
+      "public_key": "EyE4WY36/n4cHJ2SkvxG0PiH/39z2OniEqnOiHw8010="
+    }
+  ],
+  "schema": "courselens.worker-mirror.root.v1"
+}

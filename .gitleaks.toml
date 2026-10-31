@@ -1,0 +1,13 @@
+# 公共镜像仓 gitleaks 配置：默认规则全量保留，仅放行模型完整性哈希的一处误报。
+# scripts/install_models.py 把模型文件名与 sha256 完整性钉成对；文件名形如
+# tokens.json 含 "token" 关键词，其后随的 64 位十六进制下载校验和会被
+# generic-api-key 规则误报为密钥。该文件内容仅为下载校验和与仓库 URL，
+# 不承载凭据（boundary 门另有凭据扫描），故按路径整文件放行。
+[extend]
+useDefault = true
+
+[allowlist]
+  description = "Model file integrity sha256 pins in scripts/install_models.py"
+  paths = [
+    '''^scripts/install_models\.py$''',
+  ]
